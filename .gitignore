@@ -15,8 +15,10 @@ htmlcov/
 # 配置与密钥
 .env
 config.local.yaml
-config.py                  # 旧项目遗留文件（含硬编码密码与本地路径），不属于本 RAG 项目
-/package-lock.json         # 根目录空壳锁文件，真正的锁文件在 frontend/package-lock.json
+# 旧项目遗留文件：含硬编码密码与本地绝对路径，不属于本 RAG 项目，不提交
+config.py
+# 根目录空壳锁文件，真正的前端锁文件在 frontend/package-lock.json
+/package-lock.json
 
 # 运行时产物
 logs/
