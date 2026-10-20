@@ -60,12 +60,18 @@ export function buildApiUrl(path) {
   return `${API_BASE}${normalized}`
 }
 
-/** 拼接查询参数（自动忽略空值） */
+/** 拼接查询参数（自动忽略空值；数组展开为多个同名参数，如 kb_ids=1&kb_ids=2） */
 function appendQuery(url, params) {
   if (!params) return url
   const search = new URLSearchParams()
   Object.entries(params).forEach(([key, value]) => {
     if (value === undefined || value === null || value === '') return
+    if (Array.isArray(value)) {
+      value.forEach((item) => {
+        if (item !== undefined && item !== null && item !== '') search.append(key, String(item))
+      })
+      return
+    }
     search.append(key, String(value))
   })
   const qs = search.toString()

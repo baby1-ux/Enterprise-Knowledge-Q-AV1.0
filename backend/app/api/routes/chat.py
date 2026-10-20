@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 from fastapi import APIRouter, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from ...core.config import Settings
@@ -13,6 +15,7 @@ from ...db.session import get_db
 from ...schemas.chat import (
     ChatModelsOut,
     ChatStreamRequest,
+    MessageFeedbackUpdate,
     MessageOut,
     SessionCreate,
     SessionOut,
@@ -99,6 +102,36 @@ def list_messages(
     """读取会话的全部历史消息（含引用来源）。"""
     messages: list[ChatMessage] = service.list_messages(current_user.id, session_id)
     return ok([dump(MessageOut(**message_to_dict(message))) for message in messages])
+
+
+@router.get("/sessions/{session_id}/export", summary="导出会话（Markdown）")
+def export_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    service: ChatService = Depends(get_chat_service),
+) -> Response:
+    """导出会话为 Markdown 文件（含回答、引用来源与推理参数）。"""
+    markdown = service.export_session_markdown(current_user.id, session_id)
+    session = service.get_session(current_user.id, session_id)
+    filename = f"{session.name or '对话'}.md"
+    # 文件名做 URL 编码，避免中文在响应头中报错
+    return Response(
+        content=markdown.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+@router.put("/messages/{message_id}/feedback", summary="消息反馈（赞/踩）")
+def feedback_message(
+    message_id: int,
+    payload: MessageFeedbackUpdate,
+    current_user: User = Depends(get_current_user),
+    service: ChatService = Depends(get_chat_service),
+) -> dict:
+    """对助手回答提交反馈：like / dislike / 取消（feedback 传 null）。"""
+    message = service.feedback_message(current_user.id, message_id, payload.feedback)
+    return ok(dump(MessageOut(**message_to_dict(message))), "反馈成功")
 
 
 # ============================================================ 流式问答

@@ -119,6 +119,36 @@ class ChunkPageOut(BaseModel):
     items: list[ChunkOut] = []
 
 
+class SearchChunkOut(BaseModel):
+    """跨库分块搜索结果（带文档名与知识库名）。"""
+
+    id: int
+    document_id: int = 0
+    doc_name: str = ""
+    kb_id: int = 0
+    kb_name: str = ""
+    chunk_index: int = 0
+    content: str
+    page_no: int | None = None
+    enabled: bool = True
+    created_at: str | None = None
+
+
+class BatchUploadItem(BaseModel):
+    """批量上传中单个文件的结果。"""
+
+    filename: str = ""
+    message: str = ""
+    document: DocumentOut | None = None
+
+
+class BatchUploadOut(BaseModel):
+    """批量上传结果：成功列表 + 失败列表。"""
+
+    uploaded: list[DocumentOut] = []
+    failed: list[BatchUploadItem] = []
+
+
 class ChunkUpdate(BaseModel):
     """更新分块内容。"""
 

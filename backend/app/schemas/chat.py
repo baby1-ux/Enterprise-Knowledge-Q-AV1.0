@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field, field_validator
 from .common import TimestampSchema
 from .kb import _validate_mode
 
+FEEDBACK_CHOICES = ("like", "dislike")
+
 
 class ModelOptionOut(BaseModel):
     """可选大模型。"""
@@ -118,7 +120,24 @@ class MessageOut(TimestampSchema):
     role: str
     content: str
     citations: list[CitationOut] = []
+    feedback: str | None = None
     created_at: str | None = None
+
+
+class MessageFeedbackUpdate(BaseModel):
+    """消息反馈：like（点赞）/ dislike（点踩）/ null（取消）。"""
+
+    feedback: str | None = Field(None, description="like / dislike，传 null 取消反馈")
+
+    @field_validator("feedback")
+    @classmethod
+    def check_feedback(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().lower()
+        if value not in FEEDBACK_CHOICES:
+            raise ValueError("反馈仅支持 like（点赞）或 dislike（点踩）")
+        return value
 
 
 class ChatStreamRequest(SessionParamsMixin):

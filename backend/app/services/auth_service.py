@@ -9,6 +9,7 @@ from ..core.captcha import captcha_store
 from ..core.config import Settings, settings as current_settings
 from ..core.errors import NotFoundError, ValidationError
 from ..core.logging import get_logger
+from ..core.rate_limit import login_throttle
 from ..core.security import create_access_token, hash_password, verify_password
 from ..db.models import User
 from ..schemas.common import format_datetime
@@ -69,13 +70,27 @@ class AuthService:
 
     def login(self, username: str, password: str, captcha_id: str, captcha_code: str) -> tuple[User, str]:
         """用户登录，返回 (用户, 令牌)。"""
+        username = username.strip()
+
+        # 1. 防爆破检查：锁定期间直接拒绝，不再消耗图形验证码
+        locked, remain_minutes = login_throttle.check(username)
+        if locked:
+            logger.info("登录被锁定拦截：username=%s 剩余约 %s 分钟", username, remain_minutes)
+            raise ValidationError(f"登录失败次数过多，账号已锁定，请 {remain_minutes} 分钟后再试")
+
+        # 2. 图形验证码（错误不计入失败次数，未验证身份不应连坐）
         self.verify_captcha(captcha_id, captcha_code)
 
-        user = self.get_user_by_username(username.strip())
+        user = self.get_user_by_username(username)
         if user is None or not verify_password(password, user.password_hash):
+            just_locked, _ = login_throttle.record_failure(username)
+            if just_locked:
+                logger.info("登录失败达到上限，账号已锁定：username=%s", username)
+                raise ValidationError(f"登录失败次数过多，账号已锁定，请 {self.settings.app.login_lock_minutes} 分钟后再试")
             logger.info("登录失败（账号或密码错误）：username=%s", username)
             raise ValidationError("账号或密码错误，请重新输入")
 
+        login_throttle.record_success(username)
         token = create_access_token(
             subject=user.id,
             secret_key=self.settings.app.secret_key,

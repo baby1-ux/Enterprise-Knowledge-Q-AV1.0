@@ -15,16 +15,20 @@
 
 | 模块 | 能力 |
 | --- | --- |
-| 账号体系 | 注册（4 字段：账号/密码/确认密码/图形验证码）、登录（3 字段）、图形验证码（一次性、5 分钟有效）、JWT 登录态 |
-| 知识库 | 多知识库；文档列表；删除级联清理分块与向量；每库默认检索方式 |
-| 文档解析 | PDF、PPTX、Markdown、TXT、DOCX、图片（OCR）；按页/按标题保留来源位置 |
+| 账号体系 | 注册（4 字段：账号/密码/确认密码/图形验证码）、登录（3 字段）、图形验证码（一次性、5 分钟有效）、JWT 登录态、**登录防爆破**（同一账号连续失败 5 次锁定 10 分钟，验证码错误不连坐） |
+| 知识库 | 多知识库；**名称关键字搜索**；文档列表；删除级联清理分块与向量；每库默认检索方式 |
+| 文档解析 | PDF、PPTX、Markdown、TXT、DOCX、图片（OCR）；按页/按标题保留来源位置；**批量上传**（单次最多 20 个，单文件失败不影响其它） |
 | 切块 | 中文友好的句子级切块，可配置切块大小与重叠大小（100~2000 / 0 ≤ overlap < size） |
 | 向量化 | 默认 DashScope `text-embedding-v4`（DeepSeek 无向量化接口）；可切本地 BGE-M3；离线哈希向量（免密钥演示） |
 | 检索 | 稠密检索（HNSW + COSINE）与 **混合检索**（稠密 + Milvus BM25 稀疏，WeightedRanker 融合）；可选 Rerank 重排；可选查询改写 |
+| 知识检索 | **跨库分块搜索**：按内容关键字检索用户名下全部（或指定）知识库的分块，结果可跳转文档 |
 | 问答 | **DeepSeek** `deepseek-chat` 默认、`deepseek-reasoner` 可选，SSE 流式输出；支持温度 / topP / 最长输出 token / 历史对话轮数；多知识库同时检索 |
 | 溯源 | 回答中的 `[1][2]` 与引用面板（文档名、页码、相似度、原文预览）一一对应 |
+| 问答反馈 | 助手回答支持**点赞 / 点踩 / 取消**，反馈落库持久化 |
+| 对话导出 | 一键导出会话为 **Markdown 文件**（含问答、引用来源清单与推理参数） |
+| 统计面板 | **用量统计**：知识库 / 文档 / 分块 / 会话 / 消息 / 累计回答 / 今日回答（按用户隔离） |
 | 知识维护 | 分块分页预览、关键字搜索、编辑（自动重新向量化）、启停（不参与检索）、删除 |
-| 工程化 | YAML 集中配置 + `.env` 覆盖、控制台与文件双通道日志（按天滚动 + 错误单独留存）、统一响应结构、中文提示词与错误信息 |
+| 工程化 | YAML 集中配置 + `.env` 覆盖、控制台与文件双通道日志（按天滚动 + 错误单独留存）、统一响应结构、中文提示词与错误信息、**升级自动补列**（新增字段无需手工 ALTER TABLE） |
 
 ---
 
@@ -74,7 +78,10 @@ rag实战/
 ├── scripts/
 │   ├── check_keys.py           # 两个 API Key 连通性自检（向量化 + 对话 + 推理模型）
 │   ├── smoke_e2e.py            # 端到端冒烟：建库→上传→解析入库→检索→流式问答→引用
+│   ├── smoke_new_features.py   # 新功能冒烟：统计/批量上传/跨库搜索/反馈/导出（真实服务）
 │   ├── dev_local.py            # 本地演示模式启动（SQLite + 内存向量库，无需 Docker）
+│   ├── dev.ps1                 # 一键启动前后端（Windows PowerShell，支持 -Demo/-Install）
+│   ├── clean_orphans.py        # 清理数据库已无记录的上传文件（--dry-run 预演）
 │   └── ui_flow_check.py        # 前后端联调自检（经 Vite 代理跑完整业务流）
 └── tests/                      # pytest 单元测试与接口测试（默认离线可跑）
 ```
@@ -160,11 +167,11 @@ npm run dev                   # http://127.0.0.1:5173（/api 代理到 8000）
 | 分组 | 路径 |
 | --- | --- |
 | 鉴权 | `GET /api/auth/captcha`、`POST /api/auth/register`、`POST /api/auth/login`、`GET /api/auth/me` |
-| 知识库 | `GET/POST /api/kb/`、`PUT/DELETE /api/kb/{id}` |
-| 文档 | `GET/POST /api/kb/{id}/documents`、`GET /api/kb/documents/{id}/status`、`POST .../reparse`、`DELETE .../{id}` |
-| 分块 | `GET /api/kb/documents/{id}/chunks`、`PUT/DELETE /api/kb/chunks/{id}`、`PUT /api/kb/chunks/{id}/enabled` |
-| 对话 | `GET /api/chat/models`、`/api/chat/sessions...`、`POST /api/chat/stream`（SSE） |
-| 系统 | `GET /api/health` |
+| 知识库 | `GET/POST /api/kb/`（支持 `?keyword=` 名称搜索）、`PUT/DELETE /api/kb/{id}` |
+| 文档 | `GET/POST /api/kb/{id}/documents`、`POST /api/kb/{id}/documents/batch`（批量上传）、`GET /api/kb/documents/{id}/status`、`POST .../reparse`、`DELETE .../{id}` |
+| 分块 | `GET /api/kb/documents/{id}/chunks`、`GET /api/kb/chunks/search`（跨库搜索）、`PUT/DELETE /api/kb/chunks/{id}`、`PUT /api/kb/chunks/{id}/enabled` |
+| 对话 | `GET /api/chat/models`、`/api/chat/sessions...`、`POST /api/chat/stream`（SSE）、`GET /api/chat/sessions/{id}/export`（导出 Markdown）、`PUT /api/chat/messages/{id}/feedback`（赞/踩） |
+| 系统 | `GET /api/health`、`GET /api/system/stats`（用量统计） |
 
 SSE 事件：`start` → `retrieval` → `delta`… → `done`（异常为 `error`）。
 
@@ -178,14 +185,17 @@ python -m pytest tests/ -v                            # 全部用例（SQLite + 
 python -m pytest tests/ -v -m "not integration"       # 排除集成用例
 ```
 
-**最近一次实测结果：136 个用例，134 passed、2 skipped（集成用例默认跳过），耗时约 55s。**
+**最近一次实测结果：172 个用例，170 passed、2 skipped（集成用例默认跳过），耗时约 32s。**
 
 上线前的真实链路自检（会真实调用接口，消耗额度）：
 
 ```bash
 .venv\Scripts\python.exe scripts/check_keys.py    # 校验 DashScope 向量化 + DeepSeek 对话 + reasoner
 .venv\Scripts\python.exe scripts/smoke_e2e.py     # 建库→上传→解析入库→检索→流式问答→引用（SQLite + 内存向量库）
+.venv\Scripts\python.exe scripts/smoke_new_features.py  # 新功能全链路：统计/批量上传/跨库搜索/流式问答/反馈/导出（需真实服务）
 ```
+
+> `smoke_new_features.py` 需要后端以 `captcha.debug_expose: true` 启动（脚本化登录要读取验证码明文，仅限本地调试）。
 
 ### 无 Docker 的本地演示模式
 
@@ -218,6 +228,12 @@ $env:RAG_DEMO_EXPOSE_CAPTCHA = "1"   # 需用该环境变量重启后端，脚�
 | `tests/test_kb_api.py` | 知识库 CRUD、上传入库、分块分页/编辑/启停/删除、越权隔离 |
 | `tests/test_chat_api.py` | 模型参数、会话 CRUD、SSE 事件顺序、历史轮数、引用来源、404/422 |
 | `tests/test_llm_client.py` | DeepSeek 请求体构造、推理模型省略采样参数、Key 占位识别、模型列表 |
+| `tests/test_feedback_export.py` | 消息点赞/点踩/取消、反馈边界（用户消息/非法值/越权）、会话导出 Markdown 内容 |
+| `tests/test_login_throttle.py` | 登录连续失败锁定、成功重置计数、验证码错误不连坐、锁定过期恢复 |
+| `tests/test_system_stats.py` | 统计接口空数据/使用后计数、鉴权、按用户隔离 |
+| `tests/test_batch_upload_search.py` | 批量上传（全部成功/部分失败/超量/参数非法）、跨库分块搜索（范围/分页/隔离）、知识库名称搜索 |
+| `tests/test_clean_orphans.py` | 孤儿文件识别、空目录清理（含 dry-run） |
+| `tests/test_db_migration.py` | 旧库自动补列（数据不丢失）、重复初始化幂等 |
 | `tests/test_integration_e2e.py` | 真实 MySQL + Milvus + DeepSeek + DashScope 全链路（`RAG_E2E=1` 时启用） |
 
 离线联调小贴士：把 `embedding.provider` 设为 `hash`、`milvus.provider` 设为 `memory`，即使没有 API Key 与 Milvus 也能跑通上传→检索→流式问答（答案由大模型给出，需要 Key）。
@@ -264,6 +280,8 @@ $env:RAG_DEMO_EXPOSE_CAPTCHA = "1"   # 需用该环境变量重启后端，脚�
 6. **回答提示「未在知识库中找到相关内容」**：确认对话页已勾选知识库、文档解析状态为「已完成」、分块未被停用。
 7. **流式回答不输出**：检查 `DEEPSEEK_API_KEY` 是否正确（对话）+ `DASHSCOPE_API_KEY` 是否有效（向量化）；接口会以 `error` 事件返回中文原因。
 8. **上传后解析失败提示未配置 DashScope Key**：向量化仍依赖 DashScope；如只用 DeepSeek 一个 Key，可把 `embedding.provider` 改为 `local_bge_m3`（需下载模型）或 `hash`（仅演示，语义检索能力弱）。
+9. **登录提示「登录失败次数过多，账号已锁定」**：同一账号连续输错 5 次密码会锁定 10 分钟（`config.yaml -> app.login_max_attempts` / `app.login_lock_minutes` 可调整，重启服务也会立即解锁）；验证码输错不计入失败次数。
+10. **升级后启动报「Unknown column」**：新版本启动时会自动为已有数据表补充新增列（如 `chat_messages.feedback`），一般无需手工处理；若自动补列失败，可按日志中的表名/列名手工执行 `ALTER TABLE`。
 
 ---
 

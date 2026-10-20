@@ -44,10 +44,15 @@ class KnowledgeBaseService:
         self.settings = cfg or current_settings()
 
     # ================================================================ 知识库
-    def list_knowledge_bases(self, user_id: int) -> list[dict]:
-        """列出用户的知识库（含文档数、分块数）。"""
+    def list_knowledge_bases(self, user_id: int, keyword: str = "") -> list[dict]:
+        """列出用户的知识库（含文档数、分块数），支持按名称模糊搜索。"""
+        condition = [KnowledgeBase.user_id == user_id]
+        keyword = (keyword or "").strip()
+        if keyword:
+            condition.append(KnowledgeBase.name.like(f"%{keyword}%"))
+
         kbs = self.db.scalars(
-            select(KnowledgeBase).where(KnowledgeBase.user_id == user_id).order_by(KnowledgeBase.id.desc())
+            select(KnowledgeBase).where(*condition).order_by(KnowledgeBase.id.desc())
         ).all()
         if not kbs:
             return []
@@ -226,6 +231,41 @@ class KnowledgeBaseService:
         )
         return document
 
+    def create_documents_batch(
+        self,
+        user_id: int,
+        kb_id: int,
+        files: Sequence[tuple[str, bytes]],
+        chunk_size: int,
+        chunk_overlap: int,
+        retrieval_mode: str,
+    ) -> tuple[list[Document], list[dict]]:
+        """批量保存上传文件，返回 (成功创建的文档列表, 失败项[{filename, message}])。
+
+        单个文件失败不影响其它文件（类型不支持、体积超限、重名等均记录后跳过）。
+        """
+        created: list[Document] = []
+        failures: list[dict] = []
+        for filename, content in files:
+            try:
+                document = self.create_document(
+                    user_id=user_id,
+                    kb_id=kb_id,
+                    filename=filename,
+                    content=content,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    retrieval_mode=retrieval_mode,
+                )
+                created.append(document)
+            except AppError as exc:
+                failures.append({"filename": filename, "message": exc.message})
+                logger.info("批量上传跳过文件：%s -> %s", filename, exc.message)
+            except Exception as exc:  # noqa: BLE001 - 单个文件异常不拖垮整批
+                failures.append({"filename": filename, "message": f"上传失败：{exc}"})
+                logger.warning("批量上传文件异常：%s", filename, exc_info=True)
+        return created, failures
+
     def reparse_document(self, user_id: int, doc_id: int) -> Document:
         """重置文档状态，等待后台重新解析。"""
         document = self.get_document(user_id, doc_id)
@@ -303,6 +343,63 @@ class KnowledgeBaseService:
         if document is None or document.user_id != user_id:
             raise NotFoundError("分块不存在")
         return chunk
+
+    def search_chunks_all(
+        self,
+        user_id: int,
+        keyword: str,
+        kb_ids: Sequence[int] | None = None,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> tuple[int, list[dict]]:
+        """跨知识库搜索分块（按内容关键字），返回 (总数, 带文档名/知识库名的分块列表)。"""
+        keyword = (keyword or "").strip()
+        page = max(1, int(page))
+        page_size = max(1, min(100, int(page_size)))
+        if not keyword:
+            return 0, []
+
+        # 限定搜索范围：指定的知识库需校验归属，未指定则搜索用户名下全部知识库
+        kb_condition = [KnowledgeBase.user_id == user_id]
+        if kb_ids:
+            kb_condition.append(KnowledgeBase.id.in_([int(kb_id) for kb_id in kb_ids]))
+        allowed_kb_ids = [
+            kb.id for kb in self.db.scalars(select(KnowledgeBase).where(*kb_condition)).all()
+        ]
+        if not allowed_kb_ids:
+            return 0, []
+
+        condition = [
+            Chunk.kb_id.in_(allowed_kb_ids),
+            Chunk.document_id == Document.id,
+            Document.user_id == user_id,
+            Chunk.content.like(f"%{keyword}%"),
+        ]
+        total = (
+            self.db.scalar(
+                select(func.count(Chunk.id))
+                .join(Document, Chunk.document_id == Document.id)
+                .where(*condition)
+            )
+            or 0
+        )
+        rows = self.db.execute(
+            select(Chunk, Document.filename, KnowledgeBase.name)
+            .join(Document, Chunk.document_id == Document.id)
+            .join(KnowledgeBase, Chunk.kb_id == KnowledgeBase.id)
+            .where(*condition)
+            .order_by(Chunk.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).all()
+
+        items: list[dict] = []
+        for chunk, doc_name, kb_name in rows:
+            data = chunk_to_dict(chunk)
+            data["doc_name"] = doc_name
+            data["kb_name"] = kb_name
+            items.append(data)
+        return int(total), items
 
     def update_chunk(self, user_id: int, chunk_id: int, content: str) -> Chunk:
         """编辑分块内容并重新向量化。"""

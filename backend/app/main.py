@@ -15,6 +15,7 @@ from .core.captcha import captcha_store
 from .core.config import Settings, get_settings
 from .core.errors import AppError, failure
 from .core.logging import get_logger, setup_logging
+from .core.rate_limit import login_throttle
 from .db.session import dispose_engine, init_db
 
 # 参数名 -> 中文提示
@@ -81,6 +82,10 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             length=cfg.captcha.length,
             width=cfg.captcha.width,
             height=cfg.captcha.height,
+        )
+        login_throttle.configure(
+            max_attempts=cfg.app.login_max_attempts,
+            lock_minutes=cfg.app.login_lock_minutes,
         )
         try:
             init_db(cfg)
@@ -150,6 +155,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     app.include_router(kb.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
     app.include_router(system.router, prefix="/api")
+    app.include_router(system.system_router, prefix="/api")
 
     @app.get("/", include_in_schema=False)
     def index() -> dict:

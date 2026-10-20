@@ -171,6 +171,9 @@ class ChatMessage(Base, TimestampMixin):
     role: Mapped[str] = mapped_column(String(16), nullable=False, comment="user / assistant")
     content: Mapped[str] = mapped_column(Text, nullable=False, comment="消息内容")
     citations: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True, comment="引用来源")
+    feedback: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, comment="用户反馈 like / dislike，仅助手消息"
+    )
 
     session: Mapped[ChatSession] = relationship(back_populates="messages")
 

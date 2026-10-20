@@ -1,11 +1,12 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { uploadDocument } from '@/api/kb'
+import { uploadDocument, uploadDocumentsBatch } from '@/api/kb'
 
 /**
  * 上传文档对话框
  * - 支持 pdf / ppt / pptx / md / markdown / txt / 图片 / docx
+ * - 支持多选批量上传（单次最多 20 个，单个文件失败不影响其它文件）
  * - 可配置切块大小、重叠大小、检索方式（dense 稠密 / hybrid 混合）
  * - 提交后由父组件负责轮询解析进度
  */
@@ -20,6 +21,7 @@ const emit = defineEmits(['update:modelValue', 'success'])
 const ALLOWED_EXTENSIONS = ['pdf', 'ppt', 'pptx', 'md', 'markdown', 'txt', 'png', 'jpg', 'jpeg', 'bmp', 'webp', 'docx']
 const ACCEPT_ATTR = ALLOWED_EXTENSIONS.map((ext) => `.${ext}`).join(',')
 const MAX_SIZE = 100 * 1024 * 1024 // 100MB
+const MAX_BATCH = 20 // 单次批量上传上限
 
 const visible = computed({
   get: () => props.modelValue,
@@ -30,7 +32,7 @@ const fileList = ref([])
 const submitting = ref(false)
 const form = ref({ chunk_size: 500, chunk_overlap: 50, retrieval_mode: 'hybrid' })
 
-const selectedFile = computed(() => fileList.value[0]?.raw || null)
+const selectedFiles = computed(() => fileList.value.map((item) => item.raw).filter(Boolean))
 
 /** 重置表单 */
 function resetForm() {
@@ -51,36 +53,42 @@ function getExtension(filename = '') {
   return index === -1 ? '' : filename.slice(index + 1).toLowerCase()
 }
 
-/** 选择文件：只保留最新一个文件 */
-function handleFileChange(uploadFile) {
+/** 选择文件：累积多选，逐个校验（类型 / 体积 / 数量） */
+function handleFileChange(uploadFile, uploadFiles) {
   const raw = uploadFile?.raw
   if (!raw) return
   const ext = getExtension(raw.name)
   if (!ALLOWED_EXTENSIONS.includes(ext)) {
     ElMessage.error(`不支持的文件类型：.${ext || '未知'}，仅支持 ${ALLOWED_EXTENSIONS.join(' / ')}`)
-    fileList.value = []
+    fileList.value = fileList.value.filter((item) => item.uid !== uploadFile.uid)
     return
   }
   if (raw.size > MAX_SIZE) {
-    ElMessage.error('文件过大，请上传 100MB 以内的文档')
-    fileList.value = []
+    ElMessage.error(`「${raw.name}」超过 ${formatSize(MAX_SIZE)}，已跳过`)
+    fileList.value = fileList.value.filter((item) => item.uid !== uploadFile.uid)
     return
   }
-  fileList.value = [uploadFile]
+  if (uploadFiles.length > MAX_BATCH) {
+    ElMessage.error(`单次最多上传 ${MAX_BATCH} 个文件，已跳过「${raw.name}」`)
+    fileList.value = fileList.value.filter((item) => item.uid !== uploadFile.uid)
+    return
+  }
+  fileList.value = uploadFiles
 }
 
 /** 移除文件 */
 function handleFileRemove() {
-  fileList.value = []
+  // el-upload 的 v-model:file-list 会自动同步，这里仅兜底空列表
+  if (!fileList.value.length) resetForm()
 }
 
-/** 提交上传 */
+/** 提交上传（单个文件走原接口，多个文件走批量接口） */
 async function handleSubmit() {
   if (!props.kbId) {
     ElMessage.error('缺少知识库信息，请返回文档列表重试')
     return
   }
-  if (!selectedFile.value) {
+  if (!selectedFiles.value.length) {
     ElMessage.warning('请先选择需要上传的文档')
     return
   }
@@ -97,14 +105,33 @@ async function handleSubmit() {
 
   submitting.value = true
   try {
-    const doc = await uploadDocument(props.kbId, {
-      file: selectedFile.value,
-      chunk_size: chunkSize,
-      chunk_overlap: chunkOverlap,
-      retrieval_mode: form.value.retrieval_mode
-    })
-    ElMessage.success('上传成功，正在后台解析')
-    emit('success', doc)
+    let uploaded = []
+    if (selectedFiles.value.length === 1) {
+      const doc = await uploadDocument(props.kbId, {
+        file: selectedFiles.value[0],
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+        retrieval_mode: form.value.retrieval_mode
+      })
+      uploaded = [doc]
+      ElMessage.success('上传成功，正在后台解析')
+    } else {
+      const result = await uploadDocumentsBatch(props.kbId, {
+        files: selectedFiles.value,
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+        retrieval_mode: form.value.retrieval_mode
+      })
+      uploaded = Array.isArray(result?.uploaded) ? result.uploaded : []
+      const failed = Array.isArray(result?.failed) ? result.failed : []
+      if (failed.length) {
+        const names = failed.map((item) => item.filename).filter(Boolean).join('、')
+        ElMessage.warning(`上传完成：成功 ${uploaded.length} 个，失败 ${failed.length} 个${names ? `（${names}）` : ''}`)
+      } else {
+        ElMessage.success(`上传成功，${uploaded.length} 个文档正在后台解析`)
+      }
+    }
+    emit('success', uploaded)
     visible.value = false
     resetForm()
   } catch (error) {
@@ -140,6 +167,7 @@ function formatSize(size) {
     <el-upload
       v-model:file-list="fileList"
       drag
+      multiple
       :auto-upload="false"
       :accept="ACCEPT_ATTR"
       :on-change="handleFileChange"
@@ -149,9 +177,11 @@ function formatSize(size) {
       <div class="upload-inner">
         <div class="upload-icon">↑</div>
         <p class="upload-main">将文件拖到此处，或<em>点击选择文件</em></p>
-        <p class="upload-sub">单个文件不超过 {{ formatSize(MAX_SIZE) }}</p>
+        <p class="upload-sub">支持多选，单次最多 {{ MAX_BATCH }} 个，单个文件不超过 {{ formatSize(MAX_SIZE) }}</p>
       </div>
     </el-upload>
+
+    <p v-if="fileList.length" class="upload-selected">已选择 {{ fileList.length }} 个文件</p>
 
     <div class="upload-params">
       <div class="param-item">
@@ -261,6 +291,13 @@ function formatSize(size) {
 .upload-sub {
   font-size: 11.5px;
   color: var(--text-muted);
+}
+
+.upload-selected {
+  margin-top: 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--brand-1);
 }
 
 .upload-params {

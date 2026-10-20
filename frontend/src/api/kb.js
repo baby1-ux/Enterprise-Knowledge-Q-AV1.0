@@ -7,9 +7,12 @@ import { http } from './request'
 
 /* ------------------------------ 知识库 ------------------------------ */
 
-/** 知识库列表 */
-export function listKnowledgeBases() {
-  return http.get('/kb/')
+/**
+ * 知识库列表
+ * @param {string} [keyword] 按名称模糊搜索（可选）
+ */
+export function listKnowledgeBases(keyword = '') {
+  return http.get('/kb/', { keyword })
 }
 
 /** 创建知识库 { name, description } */
@@ -46,6 +49,21 @@ export function uploadDocument(kbId, { file, chunk_size, chunk_overlap, retrieva
   formData.append('chunk_overlap', String(chunk_overlap))
   formData.append('retrieval_mode', retrieval_mode)
   return http.post(`/kb/${kbId}/documents`, formData)
+}
+
+/**
+ * 批量上传并解析文档（单次最多 20 个，单个失败不影响其它文件）
+ * @param {number|string} kbId 知识库 id
+ * @param {{ files: File[], chunk_size: number, chunk_overlap: number, retrieval_mode: string }} params
+ * @returns {Promise<{ uploaded: Array, failed: Array<{ filename: string, message: string }> }>}
+ */
+export function uploadDocumentsBatch(kbId, { files, chunk_size, chunk_overlap, retrieval_mode }) {
+  const formData = new FormData()
+  files.forEach((file) => formData.append('files', file))
+  formData.append('chunk_size', String(chunk_size))
+  formData.append('chunk_overlap', String(chunk_overlap))
+  formData.append('retrieval_mode', retrieval_mode)
+  return http.post(`/kb/${kbId}/documents/batch`, formData)
 }
 
 /** 文档解析进度 { id, status, chunk_count, error_message } */
@@ -92,4 +110,20 @@ export function setChunkEnabled(chunkId, enabled) {
 /** 删除分块 */
 export function deleteChunk(chunkId) {
   return http.del(`/kb/chunks/${chunkId}`)
+}
+
+/* ------------------------------ 全局搜索 ------------------------------ */
+
+/**
+ * 跨知识库搜索分块（按内容关键字）
+ * @param {{ keyword: string, kb_ids?: number[], page?: number, page_size?: number }} query
+ * @returns {Promise<{ total: number, page: number, page_size: number, items: Array }>}
+ */
+export function searchChunks(query = {}) {
+  return http.get('/kb/chunks/search', {
+    keyword: query.keyword ?? '',
+    kb_ids: query.kb_ids ?? [],
+    page: query.page ?? 1,
+    page_size: query.page_size ?? 10
+  })
 }

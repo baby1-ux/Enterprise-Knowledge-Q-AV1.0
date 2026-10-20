@@ -4,7 +4,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import ChatBubble from '@/components/ChatBubble.vue'
 import KbSelector from '@/components/KbSelector.vue'
 import ParamDrawer from '@/components/ParamDrawer.vue'
-import { createSession, deleteSession, fetchChatModels, listSessionMessages, listSessions, updateSession } from '@/api/chat'
+import StatsCards from '@/components/StatsCards.vue'
+import { createSession, deleteSession, exportSession, fetchChatModels, feedbackMessage, listSessionMessages, listSessions, updateSession } from '@/api/chat'
 import { streamChat } from '@/api/stream'
 
 /* ------------------------------ 基础状态 ------------------------------ */
@@ -133,6 +134,29 @@ async function loadMessages(sessionId) {
 function syncKbFromSession() {
   const session = currentSession.value
   kbIds.value = Array.isArray(session?.kb_ids) ? [...session.kb_ids] : []
+}
+
+/** 消息反馈（赞 / 踩 / 取消） */
+async function handleFeedback({ id, feedback }) {
+  const target = messages.value.find((item) => (item.message_id || item.id) === id)
+  if (!target) return
+  try {
+    const updated = await feedbackMessage(id, feedback)
+    target.feedback = updated?.feedback ?? null
+  } catch (error) {
+    ElMessage.error(error?.message || '反馈提交失败')
+  }
+}
+
+/** 导出当前会话为 Markdown 文件 */
+async function handleExport() {
+  if (!currentSessionId.value || !messages.value.length) return
+  try {
+    await exportSession(currentSessionId.value, currentSession.value?.name || '对话记录')
+    ElMessage.success('对话已导出为 Markdown 文件')
+  } catch (error) {
+    ElMessage.error(error?.message || '导出失败，请稍后重试')
+  }
 }
 
 /** 局部更新列表中的会话对象 */
@@ -541,6 +565,9 @@ onBeforeUnmount(() => {
           <el-tag v-if="!kbIds.length" type="warning" effect="light" round class="toolbar-warning">
             未选知识库
           </el-tag>
+          <el-button class="param-btn" :disabled="!messages.length" title="导出当前对话为 Markdown 文件" @click="handleExport">
+            导出对话
+          </el-button>
           <el-button class="param-btn" @click="drawerVisible = true">
             <span class="param-icon">⚙</span> 参数设置
           </el-button>
@@ -568,11 +595,12 @@ onBeforeUnmount(() => {
               {{ sample }}
             </button>
           </div>
+          <StatsCards class="welcome-stats" />
         </div>
 
         <!-- 消息列表 -->
         <div v-else class="message-list">
-          <ChatBubble v-for="item in messages" :key="item.id" :message="item" />
+          <ChatBubble v-for="item in messages" :key="item.id" :message="item" @feedback="handleFeedback" />
         </div>
       </div>
 
@@ -942,6 +970,12 @@ onBeforeUnmount(() => {
   justify-content: center;
   gap: 10px;
   margin-top: 12px;
+}
+
+.welcome-stats {
+  width: min(680px, 100%);
+  margin-top: 26px;
+  text-align: left;
 }
 
 .sample-chip {

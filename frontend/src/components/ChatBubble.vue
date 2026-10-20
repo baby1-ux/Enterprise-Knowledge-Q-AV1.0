@@ -10,15 +10,31 @@ import hljs from 'highlight.js'
  * - 生成过程中展示呼吸光标，滚动跟随由父组件负责
  */
 const props = defineProps({
-  /** { id, role, content, citations, streaming, error, stopped } */
+  /** { id, role, content, citations, feedback, streaming, error, stopped } */
   message: { type: Object, required: true }
 })
+const emit = defineEmits(['feedback'])
 
 const open = ref(true)
 const copied = ref(false)
 
 const role = computed(() => props.message?.role || 'assistant')
 const citations = computed(() => props.message?.citations || [])
+
+/** 服务端消息 id（流式消息在 start 事件后才有，本地历史消息直接用 id） */
+const serverMessageId = computed(() => props.message?.message_id ?? props.message?.id ?? null)
+const feedback = computed(() => props.message?.feedback ?? null)
+/** 反馈按钮仅在已落库的助手回答上展示 */
+const canFeedback = computed(
+  () => role.value === 'assistant' && !!props.message?.content && !props.message?.streaming && serverMessageId.value != null
+)
+
+/** 提交反馈：再次点击已选项视为取消 */
+function handleFeedback(value) {
+  if (!canFeedback.value) return
+  const next = feedback.value === value ? null : value
+  emit('feedback', { id: serverMessageId.value, feedback: next })
+}
 
 // markdown 渲染器（禁止原始 HTML，避免 XSS；开启自动识别链接）
 const md = new MarkdownIt({
@@ -133,6 +149,26 @@ async function copyContent() {
       <!-- 操作区 -->
       <div v-if="role === 'assistant' && message.content && !message.streaming" class="bubble-actions">
         <button type="button" class="ghost-btn" @click="copyContent">{{ copied ? '已复制' : '复制回答' }}</button>
+        <template v-if="canFeedback">
+          <button
+            type="button"
+            class="ghost-btn feedback-btn"
+            :class="{ 'is-active': feedback === 'like' }"
+            title="回答有帮助"
+            @click="handleFeedback('like')"
+          >
+            👍 有帮助
+          </button>
+          <button
+            type="button"
+            class="ghost-btn feedback-btn"
+            :class="{ 'is-active is-dislike': feedback === 'dislike' }"
+            title="回答没帮助"
+            @click="handleFeedback('dislike')"
+          >
+            👎 没帮助
+          </button>
+        </template>
       </div>
     </div>
   </div>
@@ -514,6 +550,23 @@ async function copyContent() {
 .bubble-actions {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.feedback-btn {
+  transition: all var(--transition-fast);
+}
+
+.feedback-btn.is-active {
+  color: var(--brand-1);
+  border-color: var(--el-color-primary-light-7);
+  background: rgba(99, 102, 241, 0.1);
+}
+
+.feedback-btn.is-active.is-dislike {
+  color: var(--el-color-danger);
+  border-color: #ffd7dd;
+  background: #fff1f3;
 }
 
 @media (max-width: 768px) {

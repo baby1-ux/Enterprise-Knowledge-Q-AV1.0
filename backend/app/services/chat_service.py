@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Iterator, Sequence
 
 from sqlalchemy import select
@@ -169,6 +170,70 @@ class ChatService:
                 select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.id.asc())
             ).all()
         )
+
+    def feedback_message(self, user_id: int, message_id: int, feedback: str | None) -> ChatMessage:
+        """对助手消息提交反馈（like / dislike / 取消）。"""
+        assert self.db is not None
+        message = self.db.get(ChatMessage, message_id)
+        if message is None:
+            raise NotFoundError("消息不存在")
+        session = self.db.get(ChatSession, message.session_id)
+        if session is None or session.user_id != user_id:
+            raise NotFoundError("消息不存在")
+        if message.role != "assistant":
+            raise ValidationError("只能对助手的回答提交反馈")
+
+        message.feedback = feedback
+        self.db.commit()
+        self.db.refresh(message)
+        logger.info("更新消息反馈：id=%s feedback=%s", message_id, feedback or "取消")
+        return message
+
+    def export_session_markdown(self, user_id: int, session_id: int) -> str:
+        """把会话导出为 Markdown 文本（含引用来源与模型参数）。"""
+        assert self.db is not None
+        session = self.get_session(user_id, session_id)
+        messages = list(
+            self.db.scalars(
+                select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.id.asc())
+            ).all()
+        )
+
+        kb_names = self.kb_names_for(user_id, session.kb_ids_list)
+        lines: list[str] = [
+            f"# {session.name}",
+            "",
+            f"- 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- 大模型：{session.model}",
+            f"- 检索方式：{'混合检索' if session.retrieval_mode == 'hybrid' else '稠密检索'}",
+            f"- 关联知识库：{'、'.join(kb_names) if kb_names else '无'}",
+            f"- 推理参数：温度 {session.temperature} / topP {session.top_p} / 最长输出 {session.max_tokens} tokens / 历史轮数 {session.history_rounds}",
+            "",
+            "---",
+            "",
+        ]
+        for message in messages:
+            if not message.content:
+                continue
+            if message.role == "user":
+                lines.append(f"## 🧑 用户")
+            else:
+                lines.append("## 🤖 助手")
+            lines.append("")
+            lines.append(message.content)
+            lines.append("")
+            citations = message.citations or []
+            if citations:
+                lines.append("**引用来源：**")
+                lines.append("")
+                for citation in citations:
+                    page_text = f" 第 {citation.get('page_no')} 页" if citation.get("page_no") else ""
+                    lines.append(
+                        f"- [{citation.get('index')}] {citation.get('doc_name', '未知文档')}"
+                        f"（知识库：{citation.get('kb_name', '未知知识库')}{page_text}，相似度 {citation.get('score', 0):.2f}）"
+                    )
+                lines.append("")
+        return "\n".join(lines).strip() + "\n"
 
     def kb_names_for(self, user_id: int, kb_ids: Sequence[int]) -> list[str]:
         """按顺序返回知识库名称，忽略不存在或不属于该用户的 ID。"""
@@ -484,6 +549,7 @@ def message_to_dict(message: ChatMessage) -> dict:
         "role": message.role,
         "content": message.content,
         "citations": citations,
+        "feedback": message.feedback,
         "created_at": format_datetime(message.created_at),
     }
 

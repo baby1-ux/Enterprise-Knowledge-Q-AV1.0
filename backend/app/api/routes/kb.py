@@ -10,6 +10,7 @@ from ...core.errors import ValidationError
 from ...core.logging import get_logger
 from ...db.models import User
 from ...schemas.kb import (
+    BatchUploadOut,
     ChunkEnabledUpdate,
     ChunkOut,
     ChunkPageOut,
@@ -19,6 +20,7 @@ from ...schemas.kb import (
     KnowledgeBaseCreate,
     KnowledgeBaseOut,
     KnowledgeBaseUpdate,
+    SearchChunkOut,
 )
 from ...services.kb_service import (
     KnowledgeBaseService,
@@ -38,11 +40,12 @@ logger = get_logger("api.kb")
 @router.get("", summary="知识库列表")
 @router.get("/", summary="知识库列表")
 def list_knowledge_bases(
+    keyword: str = Query("", description="按知识库名称模糊搜索"),
     current_user: User = Depends(get_current_user),
     service: KnowledgeBaseService = Depends(get_kb_service),
 ) -> dict:
-    """列出当前用户的知识库。"""
-    items = service.list_knowledge_bases(current_user.id)
+    """列出当前用户的知识库（支持名称关键字搜索）。"""
+    items = service.list_knowledge_bases(current_user.id, keyword=keyword)
     return ok([dump(KnowledgeBaseOut(**item)) for item in items])
 
 
@@ -141,6 +144,58 @@ async def upload_document(
     return ok(dump(DocumentOut(**document_to_dict(document))), "上传成功，正在后台解析")
 
 
+@router.post("/{kb_id}/documents/batch", summary="批量上传并解析文档")
+async def upload_documents_batch(
+    kb_id: int,
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(..., description="待解析的多个文件"),
+    chunk_size: int = Form(500, description="切块大小"),
+    chunk_overlap: int = Form(50, description="重叠大小"),
+    retrieval_mode: str = Form("hybrid", description="dense / hybrid"),
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+    cfg: Settings = Depends(get_settings_dep),
+) -> dict:
+    """批量上传文档（单次最多 20 个），后台统一解析；单个文件失败不影响其它文件。"""
+    if chunk_size < 100 or chunk_size > 2000:
+        raise ValidationError("切块大小需在 100~2000 之间")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValidationError("重叠大小需大于等于 0 且小于切块大小")
+    if retrieval_mode not in ("dense", "hybrid"):
+        raise ValidationError("检索方式仅支持 dense 或 hybrid")
+    if not files:
+        raise ValidationError("请至少选择一个文件")
+    if len(files) > 20:
+        raise ValidationError("单次最多上传 20 个文件，请分批上传")
+
+    file_payloads: list[tuple[str, bytes]] = []
+    for upload in files:
+        content = await upload.read()
+        file_payloads.append((upload.filename or "未命名文件", content))
+
+    created, failures = service.create_documents_batch(
+        user_id=current_user.id,
+        kb_id=kb_id,
+        files=file_payloads,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        retrieval_mode=retrieval_mode,
+    )
+    if created:
+        background_tasks.add_task(ingest_documents, [document.id for document in created], cfg)
+        logger.info("批量上传 %s 个文件已加入解析队列：kb=%s", len(created), kb_id)
+
+    return ok(
+        dump(
+            BatchUploadOut(
+                uploaded=[DocumentOut(**document_to_dict(document)) for document in created],
+                failed=[item for item in failures],
+            )
+        ),
+        f"上传完成：成功 {len(created)} 个，失败 {len(failures)} 个",
+    )
+
+
 @router.get("/documents/{doc_id}/status", summary="解析进度")
 def get_document_status(
     doc_id: int,
@@ -202,6 +257,22 @@ def list_chunks(
         items=[ChunkOut(**chunk_to_dict(chunk)) for chunk in chunks],
     )
     return ok(dump(data))
+
+
+@router.get("/chunks/search", summary="跨库搜索分块")
+def search_chunks(
+    keyword: str = Query(..., min_length=1, description="分块内容关键字"),
+    kb_ids: list[int] = Query(default=[], description="限定的知识库 ID，不传则搜索用户名下全部知识库"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(10, ge=1, le=100, description="每页数量"),
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """按内容关键字跨知识库搜索分块（带文档名与知识库名）。"""
+    total, items = service.search_chunks_all(
+        current_user.id, keyword, kb_ids=kb_ids, page=page, page_size=page_size
+    )
+    return ok({"total": total, "page": page, "page_size": page_size, "items": [dump(SearchChunkOut(**item)) for item in items]})
 
 
 @router.put("/chunks/{chunk_id}", summary="编辑分块")

@@ -45,6 +45,8 @@ class AppConfig(BaseModel):
     log_dir: str = "logs"
     log_level: str = "INFO"
     max_upload_size_mb: int = 50
+    login_max_attempts: int = Field(default=5, description="同一账号连续登录失败次数上限，达到后锁定")
+    login_lock_minutes: int = Field(default=10, description="登录失败达到上限后的锁定时长（分钟）")
     allowed_extensions: list[str] = Field(
         default_factory=lambda: [
             ".pdf",

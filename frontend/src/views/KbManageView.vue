@@ -1,10 +1,11 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { createKnowledgeBase, deleteKnowledgeBase, listKnowledgeBases, updateKnowledgeBase } from '@/api/kb'
+import StatsCards from '@/components/StatsCards.vue'
+import { createKnowledgeBase, deleteKnowledgeBase, listKnowledgeBases, searchChunks, updateKnowledgeBase } from '@/api/kb'
 
-// 知识库管理：卡片网格展示 + 新建 / 编辑 / 删除 + 进入文档列表
+// 知识库管理：卡片网格展示 + 新建 / 编辑 / 删除 + 名称搜索 + 跨库分块搜索
 const router = useRouter()
 
 const kbs = ref([])
@@ -24,15 +25,88 @@ const rules = {
   description: [{ max: 200, message: '描述不超过 200 个字符', trigger: 'blur' }]
 }
 
+/* ------------------------------ 名称搜索（防抖） ------------------------------ */
+const keyword = ref('')
+let searchTimer = null
+
+function handleSearchInput() {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    loadKnowledgeBases(keyword.value.trim())
+  }, 300)
+}
+
+function handleSearchClear() {
+  keyword.value = ''
+  loadKnowledgeBases('')
+}
+
+/* ------------------------------ 跨库分块搜索 ------------------------------ */
+const chunkSearchVisible = ref(false)
+const chunkSearching = ref(false)
+const chunkKeyword = ref('')
+const chunkResult = ref({ total: 0, page: 1, page_size: 10, items: [] })
+const chunkSearched = ref(false)
+
+/** 执行分块搜索 */
+async function doSearchChunks(page = 1) {
+  const text = chunkKeyword.value.trim()
+  if (!text) {
+    ElMessage.warning('请输入分块内容关键字')
+    return
+  }
+  chunkSearching.value = true
+  try {
+    const data = await searchChunks({ keyword: text, page, page_size: chunkResult.value.page_size })
+    chunkResult.value = {
+      total: Number(data?.total) || 0,
+      page: Number(data?.page) || page,
+      page_size: Number(data?.page_size) || 10,
+      items: Array.isArray(data?.items) ? data.items : []
+    }
+    chunkSearched.value = true
+  } catch (error) {
+    ElMessage.error(error?.message || '搜索失败，请稍后重试')
+  } finally {
+    chunkSearching.value = false
+  }
+}
+
+/** 打开搜索对话框时重置状态 */
+function openChunkSearch() {
+  chunkKeyword.value = ''
+  chunkResult.value = { total: 0, page: 1, page_size: 10, items: [] }
+  chunkSearched.value = false
+  chunkSearchVisible.value = true
+}
+
+/** 跳转到分块所属文档的分块预览页 */
+function goChunkDocument(item) {
+  if (!item?.document_id) return
+  const page = Math.floor((Number(item.chunk_index) || 0) / 10) + 1
+  chunkSearchVisible.value = false
+  router.push({
+    name: 'kb-chunks',
+    params: { docId: item.document_id },
+    query: { name: item.doc_name || '文档分块', page }
+  })
+}
+
+/** 内容预览（截断） */
+function previewText(text, limit = 80) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim()
+  return value.length > limit ? `${value.slice(0, limit)}…` : value
+}
+
 // 顶部统计
 const totalDocs = computed(() => kbs.value.reduce((sum, kb) => sum + Number(kb.doc_count || 0), 0))
 const totalChunks = computed(() => kbs.value.reduce((sum, kb) => sum + Number(kb.chunk_count || 0), 0))
 
 /** 加载知识库列表 */
-async function loadKnowledgeBases() {
+async function loadKnowledgeBases(searchKeyword = '') {
   loading.value = true
   try {
-    const data = await listKnowledgeBases()
+    const data = await listKnowledgeBases(searchKeyword)
     kbs.value = Array.isArray(data) ? data : []
   } catch (error) {
     ElMessage.error(error?.message || '知识库列表加载失败')
@@ -115,6 +189,10 @@ function coverText(name) {
 }
 
 onMounted(loadKnowledgeBases)
+
+onBeforeUnmount(() => {
+  if (searchTimer) clearTimeout(searchTimer)
+})
 </script>
 
 <template>
@@ -127,8 +205,23 @@ onMounted(loadKnowledgeBases)
           {{ totalChunks }} 个分块
         </p>
       </div>
-      <el-button type="primary" class="btn-gradient" @click="openCreate">＋ 新建知识库</el-button>
+      <div class="page-head-actions">
+        <el-input
+          v-model="keyword"
+          class="kb-search-input"
+          placeholder="搜索知识库名称"
+          clearable
+          @input="handleSearchInput"
+          @clear="handleSearchClear"
+        >
+          <template #prefix><span class="search-prefix">🔍</span></template>
+        </el-input>
+        <el-button @click="openChunkSearch">🔍 搜索分块</el-button>
+        <el-button type="primary" class="btn-gradient" @click="openCreate">＋ 新建知识库</el-button>
+      </div>
     </div>
+
+    <StatsCards class="page-stats" compact />
 
     <!-- 加载骨架 -->
     <div v-if="loading" class="kb-grid">
@@ -136,8 +229,9 @@ onMounted(loadKnowledgeBases)
     </div>
 
     <!-- 空状态 -->
-    <el-empty v-else-if="!kbs.length" description="还没有知识库，先创建一个吧">
-      <el-button type="primary" class="btn-gradient" @click="openCreate">创建第一个知识库</el-button>
+    <el-empty v-else-if="!kbs.length" :description="keyword ? `未找到名称包含「${keyword}」的知识库` : '还没有知识库，先创建一个吧'">
+      <el-button v-if="!keyword" type="primary" class="btn-gradient" @click="openCreate">创建第一个知识库</el-button>
+      <el-button v-else @click="handleSearchClear">清空搜索条件</el-button>
     </el-empty>
 
     <!-- 卡片网格 -->
@@ -209,10 +303,196 @@ onMounted(loadKnowledgeBases)
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- 跨库分块搜索对话框 -->
+    <el-dialog
+      v-model="chunkSearchVisible"
+      title="搜索分块"
+      width="640px"
+      :close-on-click-modal="false"
+      append-to-body
+    >
+      <div class="chunk-search-bar">
+        <el-input
+          v-model="chunkKeyword"
+          placeholder="输入分块内容关键字，跨全部知识库搜索"
+          clearable
+          @keyup.enter="doSearchChunks(1)"
+        />
+        <el-button type="primary" class="btn-gradient" :loading="chunkSearching" @click="doSearchChunks(1)">
+          搜索
+        </el-button>
+      </div>
+
+      <p v-if="chunkSearched" class="chunk-search-total">
+        共找到 <b>{{ chunkResult.total }}</b> 个分块
+      </p>
+
+      <div v-if="chunkSearching" class="chunk-search-loading">
+        <span v-for="index in 3" :key="`cs-sk-${index}`" class="skeleton-block chunk-search-skeleton"></span>
+      </div>
+
+      <ul v-else-if="chunkResult.items.length" class="chunk-search-list">
+        <li
+          v-for="item in chunkResult.items"
+          :key="item.id"
+          class="chunk-search-item"
+          @click="goChunkDocument(item)"
+        >
+          <div class="chunk-search-line">
+            <span class="chunk-search-doc ellipsis">{{ item.doc_name || '未知文档' }}</span>
+            <span class="chunk-search-kb">{{ item.kb_name || '' }}</span>
+            <span v-if="item.page_no" class="chunk-search-page">第 {{ item.page_no }} 页</span>
+            <span v-if="!item.enabled" class="chunk-search-disabled">已停用</span>
+          </div>
+          <p class="chunk-search-preview">{{ previewText(item.content) }}</p>
+        </li>
+      </ul>
+
+      <el-empty v-else-if="chunkSearched" description="未找到匹配的分块，换个关键字试试" :image-size="60" />
+
+      <template #footer>
+        <div class="chunk-search-footer">
+          <el-pagination
+            v-if="chunkResult.total > chunkResult.page_size"
+            :current-page="chunkResult.page"
+            :page-size="chunkResult.page_size"
+            :total="chunkResult.total"
+            layout="prev, pager, next"
+            @current-change="doSearchChunks"
+          />
+          <el-button @click="chunkSearchVisible = false">关闭</el-button>
+        </div>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
+.page-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.kb-search-input {
+  width: 220px;
+}
+
+.search-prefix {
+  font-size: 12px;
+}
+
+.page-stats {
+  margin-bottom: 20px;
+}
+
+/* ---------------- 跨库分块搜索 ---------------- */
+.chunk-search-bar {
+  display: flex;
+  gap: 10px;
+}
+
+.chunk-search-total {
+  margin-top: 14px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.chunk-search-total b {
+  color: var(--brand-1);
+}
+
+.chunk-search-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.chunk-search-skeleton {
+  height: 58px;
+  border-radius: var(--radius-sm);
+}
+
+.chunk-search-list {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.chunk-search-item {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.chunk-search-item:hover {
+  border-color: var(--el-color-primary-light-7);
+  background: #faf8ff;
+}
+
+.chunk-search-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.chunk-search-doc {
+  max-width: 240px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.chunk-search-kb {
+  padding: 1px 8px;
+  font-size: 11px;
+  color: var(--brand-2);
+  background: #faf8ff;
+  border: 1px solid var(--el-color-primary-light-7);
+  border-radius: 999px;
+}
+
+.chunk-search-page,
+.chunk-search-disabled {
+  padding: 1px 8px;
+  font-size: 11px;
+  color: var(--text-sub);
+  background: #fff;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+}
+
+.chunk-search-disabled {
+  color: var(--el-color-danger);
+  border-color: #ffd7dd;
+}
+
+.chunk-search-preview {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.chunk-search-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .kb-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
