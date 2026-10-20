@@ -16,9 +16,10 @@ from ...schemas.user import (
     LoginRequest,
     RegisterRequest,
     UserOut,
+    UserProfileOut,
     UserRegisterOut,
 )
-from ...services.auth_service import AuthService, user_to_dict
+from ...services.auth_service import AuthService, user_to_profile, user_to_dict
 from ..deps import get_current_user, get_settings_dep
 from ..helpers import dump, ok
 
@@ -58,14 +59,14 @@ def login(payload: LoginRequest, db: Session = Depends(get_db), cfg: Settings = 
         captcha_id=payload.captcha_id,
         captcha_code=payload.captcha_code,
     )
-    data = LoginData(access_token=token, token_type="bearer", user=UserOut(**user_to_dict(user)))
+    data = LoginData(access_token=token, token_type="bearer", user=UserProfileOut(**user_to_profile(user, db)))
     return ok(dump(data), "登录成功")
 
 
 @router.get("/me", summary="当前登录用户")
-def me(current_user: User = Depends(get_current_user)) -> dict:
-    """返回当前登录用户信息。"""
-    return ok(dump(UserOut(**user_to_dict(current_user))))
+def me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    """返回当前登录用户信息（含角色与管理员标识）。"""
+    return ok(dump(UserProfileOut(**user_to_profile(current_user, db))))
 
 
 @router.post("/logout", summary="退出登录")

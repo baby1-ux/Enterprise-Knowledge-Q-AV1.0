@@ -10,7 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api.routes import auth, chat, kb, system
+from .api.routes import admin, auth, chat, kb, system
 from .core.captcha import captcha_store
 from .core.config import Settings, get_settings
 from .core.errors import AppError, failure
@@ -154,6 +154,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     app.include_router(auth.router, prefix="/api")
     app.include_router(kb.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
+    app.include_router(admin.router, prefix="/api")
     app.include_router(system.router, prefix="/api")
     app.include_router(system.system_router, prefix="/api")
 

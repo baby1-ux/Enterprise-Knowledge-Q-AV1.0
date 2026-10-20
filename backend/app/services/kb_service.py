@@ -1,4 +1,4 @@
-"""知识库服务：知识库 / 文档 / 分块的增删改查与解析入库流水线。"""
+"""知识库服务：知识库 / 文档 / 分块的增删改查与解析入库流水线（接入 RBAC）。"""
 
 from __future__ import annotations
 
@@ -7,17 +7,18 @@ import uuid
 from pathlib import Path
 from typing import Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from ..core.config import Settings, settings as current_settings
 from ..core.errors import AppError, NotFoundError, ValidationError
 from ..core.logging import get_logger
-from ..db.models import ChatSession, Chunk, Document, KnowledgeBase
+from ..db.models import ChatSession, Chunk, Document, KnowledgeBase, User
 from ..db.session import session_scope
 from ..schemas.common import format_datetime
 from .embedding import EmbeddingError, get_embedder
 from .parsing.factory import ParseError, parse_document
+from .permission_service import PermissionService
 from .splitter import TextSplitter
 from .vector_store import VectorRecord, VectorStoreError, get_vector_store
 
@@ -36,17 +37,47 @@ def _safe_filename(filename: str) -> str:
     return name[:120]
 
 
-class KnowledgeBaseService:
-    """知识库相关业务逻辑。"""
+def _access_type(kb: KnowledgeBase, perm: PermissionService) -> str:
+    """当前用户对 KB 的访问来源：owner/admin/role/member/all/private。"""
+    if perm.is_admin():
+        return "admin"
+    if kb.user_id == perm.user.id:
+        return "owner"
+    if kb.visibility == "all":
+        return "all"
+    if kb.visibility == "role" and perm._role_ids():
+        # 简单判断：只要有角色授权（非具体 can_read 判断）即视为 role
+        return "role"
+    return "member"
 
-    def __init__(self, db: Session | None, cfg: Settings | None = None) -> None:
+
+class KnowledgeBaseService:
+    """知识库相关业务逻辑（已接入 RBAC，所有操作按当前用户身份鉴权）。"""
+
+    def __init__(
+        self,
+        db: Session | None,
+        cfg: Settings | None = None,
+        current_user: User | None = None,
+    ) -> None:
         self.db = db
         self.settings = cfg or current_settings()
+        self.current_user = current_user
+        self._perm: PermissionService | None = None
 
-    # ================================================================ 知识库
-    def list_knowledge_bases(self, user_id: int, keyword: str = "") -> list[dict]:
-        """列出用户的知识库（含文档数、分块数），支持按名称模糊搜索。"""
-        condition = [KnowledgeBase.user_id == user_id]
+    @property
+    def perm(self) -> PermissionService:
+        """请求级权限服务（首次访问时构建，要求 current_user 已注入）。"""
+        if self._perm is None:
+            if self.current_user is None:
+                raise AppError("服务实例缺少 current_user，无法进行权限校验", code=500)
+            self._perm = PermissionService(self.db, self.current_user)
+        return self._perm
+
+    # ============================================================ 知识库读路径
+    def list_knowledge_bases(self, keyword: str = "") -> list[dict]:
+        """列出当前用户可访问的全部知识库（含 own + 角色授权 + 人员直授 + 公开）。"""
+        condition = [self.perm.accessible_kb_query()]
         keyword = (keyword or "").strip()
         if keyword:
             condition.append(KnowledgeBase.name.like(f"%{keyword}%"))
@@ -71,58 +102,93 @@ class KnowledgeBaseService:
             ).all()
         )
         return [
-            {
-                "id": kb.id,
-                "name": kb.name,
-                "description": kb.description,
-                "retrieval_mode": kb.retrieval_mode,
-                "doc_count": int(doc_counts.get(kb.id, 0)),
-                "chunk_count": int(chunk_counts.get(kb.id, 0)),
-                "created_at": format_datetime(kb.created_at),
-            }
+            knowledge_base_to_dict(
+                kb,
+                doc_count=int(doc_counts.get(kb.id, 0)),
+                chunk_count=int(chunk_counts.get(kb.id, 0)),
+                can_write=self.perm.can_write(kb),
+                access_type=_access_type(kb, self.perm),
+                owner_id=kb.user_id,
+            )
             for kb in kbs
         ]
 
-    def get_knowledge_base(self, user_id: int, kb_id: int) -> KnowledgeBase:
-        """获取知识库（校验归属）。"""
+    def get_knowledge_base(self, kb_id: int) -> KnowledgeBase:
+        """按 ID 获取知识库并校验可读。"""
         kb = self.db.get(KnowledgeBase, kb_id)
         if kb is None:
             raise NotFoundError("知识库不存在")
-        if kb.user_id != user_id:
-            raise NotFoundError("知识库不存在")
+        self.perm.assert_can_read(kb)
         return kb
 
-    def create_knowledge_base(self, user_id: int, name: str, description: str = "", retrieval_mode: str = "hybrid") -> KnowledgeBase:
-        """创建知识库。"""
+    def get_knowledge_base_for_write(self, kb_id: int) -> KnowledgeBase:
+        """按 ID 获取知识库并校验可写。"""
+        kb = self.db.get(KnowledgeBase, kb_id)
+        if kb is None:
+            raise NotFoundError("知识库不存在")
+        self.perm.assert_can_write(kb)
+        return kb
+
+    # ============================================================ 知识库写路径
+    def create_knowledge_base(
+        self,
+        name: str,
+        description: str = "",
+        retrieval_mode: str = "hybrid",
+        visibility: str = "private",
+    ) -> KnowledgeBase:
+        """创建知识库（所有者为当前用户）。"""
+        if visibility not in {"private", "role", "all"}:
+            raise ValidationError("可见范围仅支持 private/role/all")
         exists = self.db.scalars(
-            select(KnowledgeBase).where(KnowledgeBase.user_id == user_id, KnowledgeBase.name == name)
+            select(KnowledgeBase).where(
+                KnowledgeBase.user_id == self.current_user.id, KnowledgeBase.name == name
+            )
         ).first()
         if exists is not None:
             raise ValidationError(f"已存在同名知识库：{name}")
 
         kb = KnowledgeBase(
-            user_id=user_id,
+            user_id=self.current_user.id,
             name=name,
             description=description or "",
             embedding_model=self.settings.embedding.model,
             embedding_dim=self.settings.embedding.dimension,
             retrieval_mode=retrieval_mode,
+            visibility=visibility,
         )
         self.db.add(kb)
         self.db.commit()
         self.db.refresh(kb)
-        logger.info("创建知识库成功：id=%s name=%s user=%s", kb.id, kb.name, user_id)
+        logger.info(
+            "创建知识库成功：id=%s name=%s user=%s visibility=%s",
+            kb.id, kb.name, self.current_user.id, kb.visibility,
+        )
         return kb
 
     def update_knowledge_base(
-        self, user_id: int, kb_id: int, name: str | None = None, description: str | None = None, retrieval_mode: str | None = None
+        self,
+        kb_id: int,
+        name: str | None = None,
+        description: str | None = None,
+        retrieval_mode: str | None = None,
+        visibility: str | None = None,
     ) -> KnowledgeBase:
-        """更新知识库信息。"""
-        kb = self.get_knowledge_base(user_id, kb_id)
+        """更新知识库信息（仅所有者可改可见范围 / 名称）。"""
+        kb = self.get_knowledge_base_for_write(kb_id)
+        if visibility is not None:
+            if visibility not in {"private", "role", "all"}:
+                raise ValidationError("可见范围仅支持 private/role/all")
+            # 仅所有者（不是被授权的写者）能改 visibility
+            if kb.user_id != self.current_user.id and not self.perm.is_admin():
+                raise AppError("仅知识库所有者可修改可见范围", code=403)
+            kb.visibility = visibility
         if name is not None and name != kb.name:
             duplicated = self.db.scalars(
                 select(KnowledgeBase).where(
-                    KnowledgeBase.user_id == user_id, KnowledgeBase.name == name, KnowledgeBase.id != kb_id
+                    KnowledgeBase.user_id == kb.user_id,
+                    KnowledgeBase.name == name,
+                    KnowledgeBase.id != kb_id,
                 )
             ).first()
             if duplicated is not None:
@@ -136,48 +202,62 @@ class KnowledgeBaseService:
         self.db.refresh(kb)
         return kb
 
-    def delete_knowledge_base(self, user_id: int, kb_id: int) -> None:
-        """删除知识库（同时清理文档、分块与向量）。"""
-        kb = self.get_knowledge_base(user_id, kb_id)
+    def delete_knowledge_base(self, kb_id: int) -> None:
+        """删除知识库（同时清理文档、分块与向量；清理引用该 KB 的所有会话配置）。"""
+        kb = self.get_knowledge_base_for_write(kb_id)
         try:
             get_vector_store(self.settings).delete_by_kb(kb.id)
         except VectorStoreError as exc:  # 向量清理失败不阻塞业务删除
             logger.warning("删除知识库向量失败（已忽略）：%s", exc)
 
-        # 清理引用该知识库的会话配置，避免残留无效 ID
-        for session in self.db.scalars(select(ChatSession).where(ChatSession.user_id == user_id)).all():
-            kb_ids = session.kb_ids_list
-            if kb.id in kb_ids:
-                session.kb_ids = [item for item in kb_ids if item != kb.id]
+        # 清理所有引用该 KB 的会话配置（不限所有者，避免遗留无效 ID）
+        # JSON 列 like 操作为方言相关且 SQLAlchemy 2.0 起将弃用，改用 Python 端过滤
+        for session in self.db.scalars(select(ChatSession)).all():
+            if kb.id in session.kb_ids_list:
+                session.kb_ids = [item for item in session.kb_ids_list if item != kb.id]
 
         self.db.delete(kb)
         self.db.commit()
-        logger.info("删除知识库成功：id=%s user=%s", kb_id, user_id)
+        logger.info("删除知识库成功：id=%s", kb_id)
 
-    # ================================================================ 文档
+    # ============================================================ 文档
     def document_counts(self, kb_id: int) -> tuple[int, int]:
         """返回 (文档数, 分块数)。"""
         doc_count = self.db.scalar(select(func.count(Document.id)).where(Document.kb_id == kb_id)) or 0
         chunk_count = self.db.scalar(select(func.count(Chunk.id)).where(Chunk.kb_id == kb_id)) or 0
         return int(doc_count), int(chunk_count)
 
-    def list_documents(self, user_id: int, kb_id: int) -> list[Document]:
-        """列出知识库下的文档。"""
-        self.get_knowledge_base(user_id, kb_id)
+    def list_documents(self, kb_id: int) -> list[Document]:
+        """列出知识库下的文档（仅校验 KB 可读）。"""
+        self.get_knowledge_base(kb_id)
         return list(
             self.db.scalars(select(Document).where(Document.kb_id == kb_id).order_by(Document.id.desc())).all()
         )
 
-    def get_document(self, user_id: int, doc_id: int) -> Document:
-        """获取文档（校验归属）。"""
+    def get_document(self, doc_id: int) -> Document:
+        """按 ID 获取文档（通过所属 KB 的可读性校验）。"""
         document = self.db.get(Document, doc_id)
-        if document is None or document.user_id != user_id:
+        if document is None:
             raise NotFoundError("文档不存在")
+        kb = self.db.get(KnowledgeBase, document.kb_id)
+        if kb is None:
+            raise NotFoundError("文档不存在")
+        self.perm.assert_can_read(kb)
+        return document
+
+    def get_document_for_write(self, doc_id: int) -> Document:
+        """按 ID 获取文档（通过所属 KB 的可写性校验）。"""
+        document = self.db.get(Document, doc_id)
+        if document is None:
+            raise NotFoundError("文档不存在")
+        kb = self.db.get(KnowledgeBase, document.kb_id)
+        if kb is None:
+            raise NotFoundError("文档不存在")
+        self.perm.assert_can_write(kb)
         return document
 
     def create_document(
         self,
-        user_id: int,
         kb_id: int,
         filename: str,
         content: bytes,
@@ -186,7 +266,7 @@ class KnowledgeBaseService:
         retrieval_mode: str,
     ) -> Document:
         """保存上传文件并创建文档记录（解析在后台进行）。"""
-        kb = self.get_knowledge_base(user_id, kb_id)
+        kb = self.get_knowledge_base_for_write(kb_id)
         safe_name = _safe_filename(filename)
         suffix = Path(safe_name).suffix.lower()
         allowed = {ext.lower() for ext in self.settings.app.allowed_extensions}
@@ -199,7 +279,7 @@ class KnowledgeBaseService:
         if chunk_overlap >= chunk_size:
             raise ValidationError("重叠大小必须小于切块大小")
 
-        target_dir = self.settings.upload_path / str(user_id) / str(kb.id)
+        target_dir = self.settings.upload_path / str(kb.user_id) / str(kb.id)
         target_dir.mkdir(parents=True, exist_ok=True)
         stored_name = f"{uuid.uuid4().hex[:12]}_{safe_name}"
         stored_path = target_dir / stored_name
@@ -207,7 +287,7 @@ class KnowledgeBaseService:
 
         document = Document(
             kb_id=kb.id,
-            user_id=user_id,
+            user_id=self.current_user.id,
             filename=safe_name,
             stored_path=str(stored_path),
             file_type=suffix.lstrip("."),
@@ -233,7 +313,6 @@ class KnowledgeBaseService:
 
     def create_documents_batch(
         self,
-        user_id: int,
         kb_id: int,
         files: Sequence[tuple[str, bytes]],
         chunk_size: int,
@@ -249,7 +328,6 @@ class KnowledgeBaseService:
         for filename, content in files:
             try:
                 document = self.create_document(
-                    user_id=user_id,
                     kb_id=kb_id,
                     filename=filename,
                     content=content,
@@ -266,9 +344,9 @@ class KnowledgeBaseService:
                 logger.warning("批量上传文件异常：%s", filename, exc_info=True)
         return created, failures
 
-    def reparse_document(self, user_id: int, doc_id: int) -> Document:
+    def reparse_document(self, doc_id: int) -> Document:
         """重置文档状态，等待后台重新解析。"""
-        document = self.get_document(user_id, doc_id)
+        document = self.get_document_for_write(doc_id)
         if not Path(document.stored_path).exists():
             raise ValidationError("原始文件已丢失，请重新上传")
         self._reset_document_data(document)
@@ -280,9 +358,9 @@ class KnowledgeBaseService:
         logger.info("文档已重置，等待重新解析：id=%s", document.id)
         return document
 
-    def delete_document(self, user_id: int, doc_id: int) -> None:
+    def delete_document(self, doc_id: int) -> None:
         """删除文档及其分块与向量。"""
-        document = self.get_document(user_id, doc_id)
+        document = self.get_document_for_write(doc_id)
         try:
             get_vector_store(self.settings).delete_by_documents([document.id])
         except VectorStoreError as exc:
@@ -309,12 +387,12 @@ class KnowledgeBaseService:
             self.db.delete(chunk)
         self.db.flush()
 
-    # ================================================================ 分块
+    # ============================================================ 分块
     def list_chunks(
-        self, user_id: int, doc_id: int, page: int = 1, page_size: int = 10, keyword: str = ""
+        self, doc_id: int, page: int = 1, page_size: int = 10, keyword: str = ""
     ) -> tuple[int, list[Chunk]]:
         """分页查询分块。"""
-        document = self.get_document(user_id, doc_id)
+        document = self.get_document(doc_id)
         page = max(1, int(page))
         page_size = max(1, min(100, int(page_size)))
 
@@ -334,45 +412,57 @@ class KnowledgeBaseService:
         )
         return int(total), items
 
-    def get_chunk(self, user_id: int, chunk_id: int) -> Chunk:
-        """获取分块（校验归属）。"""
+    def get_chunk(self, chunk_id: int) -> Chunk:
+        """按 ID 获取分块（按所属 KB 的可读性校验）。"""
         chunk = self.db.get(Chunk, chunk_id)
         if chunk is None:
             raise NotFoundError("分块不存在")
-        document = self.db.get(Document, chunk.document_id)
-        if document is None or document.user_id != user_id:
+        kb = self.db.get(KnowledgeBase, chunk.kb_id)
+        if kb is None:
             raise NotFoundError("分块不存在")
+        self.perm.assert_can_read(kb)
+        return chunk
+
+    def get_chunk_for_write(self, chunk_id: int) -> Chunk:
+        """按 ID 获取分块（按所属 KB 的可写性校验）。"""
+        chunk = self.db.get(Chunk, chunk_id)
+        if chunk is None:
+            raise NotFoundError("分块不存在")
+        kb = self.db.get(KnowledgeBase, chunk.kb_id)
+        if kb is None:
+            raise NotFoundError("分块不存在")
+        self.perm.assert_can_write(kb)
         return chunk
 
     def search_chunks_all(
         self,
-        user_id: int,
         keyword: str,
         kb_ids: Sequence[int] | None = None,
         page: int = 1,
         page_size: int = 10,
     ) -> tuple[int, list[dict]]:
-        """跨知识库搜索分块（按内容关键字），返回 (总数, 带文档名/知识库名的分块列表)。"""
+        """跨知识库搜索分块（按内容关键字），范围=用户可访问的全部 KB ∩ 传入 kb_ids。"""
         keyword = (keyword or "").strip()
         page = max(1, int(page))
         page_size = max(1, min(100, int(page_size)))
         if not keyword:
             return 0, []
 
-        # 限定搜索范围：指定的知识库需校验归属，未指定则搜索用户名下全部知识库
-        kb_condition = [KnowledgeBase.user_id == user_id]
+        accessible = self.perm.accessible_kb_ids()
         if kb_ids:
-            kb_condition.append(KnowledgeBase.id.in_([int(kb_id) for kb_id in kb_ids]))
-        allowed_kb_ids = [
-            kb.id for kb in self.db.scalars(select(KnowledgeBase).where(*kb_condition)).all()
-        ]
+            try:
+                target_ids = {int(kb_id) for kb_id in kb_ids}
+            except (TypeError, ValueError):
+                target_ids = set()
+            allowed_kb_ids = accessible & target_ids
+        else:
+            allowed_kb_ids = accessible
         if not allowed_kb_ids:
             return 0, []
 
         condition = [
             Chunk.kb_id.in_(allowed_kb_ids),
             Chunk.document_id == Document.id,
-            Document.user_id == user_id,
             Chunk.content.like(f"%{keyword}%"),
         ]
         total = (
@@ -401,9 +491,9 @@ class KnowledgeBaseService:
             items.append(data)
         return int(total), items
 
-    def update_chunk(self, user_id: int, chunk_id: int, content: str) -> Chunk:
+    def update_chunk(self, chunk_id: int, content: str) -> Chunk:
         """编辑分块内容并重新向量化。"""
-        chunk = self.get_chunk(user_id, chunk_id)
+        chunk = self.get_chunk_for_write(chunk_id)
         chunk.content = content.strip()
         self.db.flush()
         try:
@@ -416,9 +506,9 @@ class KnowledgeBaseService:
         logger.info("更新分块成功：id=%s", chunk_id)
         return chunk
 
-    def set_chunk_enabled(self, user_id: int, chunk_id: int, enabled: bool) -> Chunk:
+    def set_chunk_enabled(self, chunk_id: int, enabled: bool) -> Chunk:
         """启用/禁用分块（禁用的分块不参与检索）。"""
-        chunk = self.get_chunk(user_id, chunk_id)
+        chunk = self.get_chunk_for_write(chunk_id)
         chunk.enabled = bool(enabled)
         self.db.flush()
         try:
@@ -430,9 +520,9 @@ class KnowledgeBaseService:
         self.db.refresh(chunk)
         return chunk
 
-    def delete_chunk(self, user_id: int, chunk_id: int) -> None:
+    def delete_chunk(self, chunk_id: int) -> None:
         """删除分块及其向量。"""
-        chunk = self.get_chunk(user_id, chunk_id)
+        chunk = self.get_chunk_for_write(chunk_id)
         document_id = chunk.document_id
         try:
             get_vector_store(self.settings).delete_chunks([chunk.id])
@@ -467,7 +557,7 @@ class KnowledgeBaseService:
             ]
         )
 
-    # ================================================================ 入库流水线
+    # ============================================================ 入库流水线
     def ingest_document_sync(self, doc_id: int) -> None:
         """完整执行解析 → 切块 → 向量化（供后台任务调用，使用独立会话）。"""
         started = time.time()
@@ -588,6 +678,7 @@ def chunk_to_dict(chunk: Chunk) -> dict:
     return {
         "id": chunk.id,
         "document_id": chunk.document_id,
+        "kb_id": chunk.kb_id,
         "chunk_index": chunk.chunk_index,
         "content": chunk.content,
         "page_no": chunk.page_no,
@@ -596,13 +687,25 @@ def chunk_to_dict(chunk: Chunk) -> dict:
     }
 
 
-def knowledge_base_to_dict(kb: KnowledgeBase, doc_count: int = 0, chunk_count: int = 0) -> dict:
-    """知识库对象转响应字典。"""
+def knowledge_base_to_dict(
+    kb: KnowledgeBase,
+    doc_count: int = 0,
+    chunk_count: int = 0,
+    *,
+    can_write: bool = False,
+    access_type: str = "owner",
+    owner_id: int | None = None,
+) -> dict:
+    """知识库对象转响应字典（含权限元信息）。"""
     return {
         "id": kb.id,
         "name": kb.name,
         "description": kb.description or "",
         "retrieval_mode": kb.retrieval_mode,
+        "visibility": kb.visibility,
+        "owner_id": owner_id if owner_id is not None else kb.user_id,
+        "access_type": access_type,
+        "can_write": can_write,
         "doc_count": doc_count,
         "chunk_count": chunk_count,
         "created_at": format_datetime(kb.created_at),

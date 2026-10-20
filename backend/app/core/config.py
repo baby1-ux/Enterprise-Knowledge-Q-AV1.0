@@ -47,6 +47,8 @@ class AppConfig(BaseModel):
     max_upload_size_mb: int = 50
     login_max_attempts: int = Field(default=5, description="同一账号连续登录失败次数上限，达到后锁定")
     login_lock_minutes: int = Field(default=10, description="登录失败达到上限后的锁定时长（分钟）")
+    # 注册时自动授予 admin 角色的账号（与现有用户隔离，便于首部署引导）
+    admin_usernames: list[str] = Field(default_factory=list, description="注册即授予管理员角色的账号白名单")
     allowed_extensions: list[str] = Field(
         default_factory=lambda: [
             ".pdf",

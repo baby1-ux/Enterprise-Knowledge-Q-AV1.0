@@ -9,10 +9,16 @@ const auth = useAuthStore()
 const router = useRouter()
 const route = useRoute()
 
-const navItems = [
-  { label: '对话', path: '/chat', match: ['/chat'] },
-  { label: '知识库', path: '/kb', match: ['/kb'] }
-]
+const navItems = computed(() => {
+  const base = [
+    { label: '对话', path: '/chat', match: ['/chat'] },
+    { label: '知识库', path: '/kb', match: ['/kb'] }
+  ]
+  if (auth.isAdmin) {
+    base.push({ label: '系统管理', path: '/admin', match: ['/admin'] })
+  }
+  return base
+})
 
 // 用户名首字符作为头像
 const avatarText = computed(() => (auth.username || '用').slice(0, 1).toUpperCase())
@@ -31,13 +37,14 @@ async function handleCommand(command) {
 }
 
 onMounted(async () => {
-  // 刷新页面后若本地缺少用户信息，则回源拉取一次
-  if (auth.isLoggedIn && !auth.user) {
-    try {
-      await auth.loadCurrentUser()
-    } catch {
-      // 401 已由请求层统一处理（清登录态并跳转登录页）
-    }
+  // 每次进入布局都回源拉取一次用户信息：
+  // 1. 校验 token 是否仍有效（401 由请求层统一处理并跳登录页）
+  // 2. 刷新 roles / is_admin，兼容「登录后角色被调整」与旧版本 localStorage 无 roles 的情况
+  if (!auth.isLoggedIn) return
+  try {
+    await auth.loadCurrentUser()
+  } catch {
+    // 401 已由请求层统一处理（清登录态并跳转登录页）
   }
 })
 </script>

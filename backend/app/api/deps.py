@@ -63,14 +63,18 @@ def get_db_session(db: Session = Depends(get_db)) -> Iterator[Session]:
 
 
 def get_kb_service(
-    db: Session = Depends(get_db), cfg: Settings = Depends(get_settings_dep)
+    db: Session = Depends(get_db),
+    cfg: Settings = Depends(get_settings_dep),
+    current_user: User = Depends(get_current_user),
 ) -> KnowledgeBaseService:
-    """知识库服务。"""
-    return KnowledgeBaseService(db, cfg)
+    """知识库服务（已注入当前登录用户）。"""
+    return KnowledgeBaseService(db, cfg, current_user=current_user)
 
 
 def get_chat_service(
-    db: Session = Depends(get_db), cfg: Settings = Depends(get_settings_dep)
+    db: Session = Depends(get_db),
+    cfg: Settings = Depends(get_settings_dep),
+    current_user: User = Depends(get_current_user),
 ) -> ChatService:
-    """对话服务。"""
-    return ChatService(db, cfg)
+    """对话服务（已注入当前登录用户）。"""
+    return ChatService(db, cfg, current_user=current_user)

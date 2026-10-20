@@ -11,10 +11,11 @@ from sqlalchemy.orm import Session
 from ..core.config import Settings, settings as current_settings
 from ..core.errors import NotFoundError, ValidationError
 from ..core.logging import get_logger
-from ..db.models import ChatMessage, ChatSession, Document, KnowledgeBase
+from ..db.models import ChatMessage, ChatSession, Document, KnowledgeBase, User
 from ..db.session import session_scope
 from ..schemas.common import format_datetime
 from .llm import LLMClient, LLMError, get_llm
+from .permission_service import PermissionService
 from .prompt import (
     ContextItem,
     build_messages,
@@ -37,11 +38,22 @@ class ChatService:
         cfg: Settings | None = None,
         retriever: Retriever | None = None,
         llm: LLMClient | None = None,
+        current_user: User | None = None,
     ) -> None:
         self.db = db
         self.settings = cfg or current_settings()
         self._retriever = retriever
         self._llm = llm
+        self.current_user = current_user
+        self._perm: PermissionService | None = None
+
+    @property
+    def perm(self) -> PermissionService:
+        if self._perm is None:
+            if self.current_user is None or self.db is None:
+                raise ValidationError("缺少当前用户或数据库会话")
+            self._perm = PermissionService(self.db, self.current_user)
+        return self._perm
 
     # ------------------------------------------------------------------ 依赖
     @property
@@ -74,11 +86,13 @@ class ChatService:
         }
 
     # ------------------------------------------------------------------ 会话
-    def list_sessions(self, user_id: int) -> list[dict]:
-        """列出用户的会话，附带知识库名称。"""
+    def list_sessions(self) -> list[dict]:
+        """列出当前用户的会话，附带知识库名称。"""
         assert self.db is not None
         sessions = self.db.scalars(
-            select(ChatSession).where(ChatSession.user_id == user_id).order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
+            select(ChatSession)
+            .where(ChatSession.user_id == self.current_user.id)
+            .order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
         ).all()
         if not sessions:
             return []
@@ -86,10 +100,13 @@ class ChatService:
         kb_ids: set[int] = set()
         for session in sessions:
             kb_ids.update(session.kb_ids_list)
+        # 仅显示当前用户仍可访问的知识库名称
+        accessible = self.perm.accessible_kb_ids()
         name_map: dict[int, str] = {}
         if kb_ids:
             for kb in self.db.scalars(select(KnowledgeBase).where(KnowledgeBase.id.in_(kb_ids))).all():
-                name_map[kb.id] = kb.name
+                if kb.id in accessible:
+                    name_map[kb.id] = kb.name
 
         result = []
         for session in sessions:
@@ -98,22 +115,22 @@ class ChatService:
             result.append(item)
         return result
 
-    def get_session(self, user_id: int, session_id: int) -> ChatSession:
+    def get_session(self, session_id: int) -> ChatSession:
         """获取会话（校验归属）。"""
         assert self.db is not None
         session = self.db.get(ChatSession, session_id)
-        if session is None or session.user_id != user_id:
+        if session is None or session.user_id != self.current_user.id:
             raise NotFoundError("会话不存在")
         return session
 
-    def create_session(self, user_id: int, payload) -> ChatSession:
+    def create_session(self, payload) -> ChatSession:
         """新建会话。"""
         assert self.db is not None
         defaults = self.settings.llm.defaults
         session = ChatSession(
-            user_id=user_id,
+            user_id=self.current_user.id,
             name=(payload.name or DEFAULT_SESSION_NAME),
-            kb_ids=self._validate_kb_ids(user_id, payload.kb_ids or []),
+            kb_ids=self.perm.filter_readable_kb_ids(payload.kb_ids or []),
             model=self._resolve_model(payload.model),
             temperature=payload.temperature if payload.temperature is not None else defaults.temperature,
             top_p=payload.top_p if payload.top_p is not None else defaults.top_p,
@@ -124,18 +141,18 @@ class ChatService:
         self.db.add(session)
         self.db.commit()
         self.db.refresh(session)
-        logger.info("创建会话：id=%s user=%s name=%s", session.id, user_id, session.name)
+        logger.info("创建会话：id=%s user=%s name=%s", session.id, self.current_user.id, session.name)
         return session
 
-    def update_session(self, user_id: int, session_id: int, payload) -> ChatSession:
+    def update_session(self, session_id: int, payload) -> ChatSession:
         """更新会话（名称、知识库、模型与推理参数）。"""
         assert self.db is not None
-        session = self.get_session(user_id, session_id)
+        session = self.get_session(session_id)
 
         if payload.name is not None:
             session.name = payload.name
         if payload.kb_ids is not None:
-            session.kb_ids = self._validate_kb_ids(user_id, payload.kb_ids)
+            session.kb_ids = self.perm.filter_readable_kb_ids(payload.kb_ids)
         if payload.model is not None:
             session.model = self._resolve_model(payload.model, session.model)
         if payload.temperature is not None:
@@ -153,32 +170,32 @@ class ChatService:
         self.db.refresh(session)
         return session
 
-    def delete_session(self, user_id: int, session_id: int) -> None:
+    def delete_session(self, session_id: int) -> None:
         """删除会话及其消息。"""
         assert self.db is not None
-        session = self.get_session(user_id, session_id)
+        session = self.get_session(session_id)
         self.db.delete(session)
         self.db.commit()
         logger.info("删除会话：id=%s", session_id)
 
-    def list_messages(self, user_id: int, session_id: int) -> list[ChatMessage]:
+    def list_messages(self, session_id: int) -> list[ChatMessage]:
         """列出会话消息（按时间正序）。"""
         assert self.db is not None
-        session = self.get_session(user_id, session_id)
+        session = self.get_session(session_id)
         return list(
             self.db.scalars(
                 select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.id.asc())
             ).all()
         )
 
-    def feedback_message(self, user_id: int, message_id: int, feedback: str | None) -> ChatMessage:
+    def feedback_message(self, message_id: int, feedback: str | None) -> ChatMessage:
         """对助手消息提交反馈（like / dislike / 取消）。"""
         assert self.db is not None
         message = self.db.get(ChatMessage, message_id)
         if message is None:
             raise NotFoundError("消息不存在")
         session = self.db.get(ChatSession, message.session_id)
-        if session is None or session.user_id != user_id:
+        if session is None or session.user_id != self.current_user.id:
             raise NotFoundError("消息不存在")
         if message.role != "assistant":
             raise ValidationError("只能对助手的回答提交反馈")
@@ -189,17 +206,17 @@ class ChatService:
         logger.info("更新消息反馈：id=%s feedback=%s", message_id, feedback or "取消")
         return message
 
-    def export_session_markdown(self, user_id: int, session_id: int) -> str:
+    def export_session_markdown(self, session_id: int) -> str:
         """把会话导出为 Markdown 文本（含引用来源与模型参数）。"""
         assert self.db is not None
-        session = self.get_session(user_id, session_id)
+        session = self.get_session(session_id)
         messages = list(
             self.db.scalars(
                 select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.id.asc())
             ).all()
         )
 
-        kb_names = self.kb_names_for(user_id, session.kb_ids_list)
+        kb_names = self.kb_names_for(session.kb_ids_list)
         lines: list[str] = [
             f"# {session.name}",
             "",
@@ -235,15 +252,16 @@ class ChatService:
                 lines.append("")
         return "\n".join(lines).strip() + "\n"
 
-    def kb_names_for(self, user_id: int, kb_ids: Sequence[int]) -> list[str]:
-        """按顺序返回知识库名称，忽略不存在或不属于该用户的 ID。"""
+    def kb_names_for(self, kb_ids: Sequence[int]) -> list[str]:
+        """按顺序返回知识库名称，忽略不存在或当前用户无权访问的 ID。"""
         assert self.db is not None
         if not kb_ids:
             return []
+        accessible = self.perm.accessible_kb_ids()
         rows = self.db.scalars(
-            select(KnowledgeBase).where(KnowledgeBase.id.in_(list(kb_ids)), KnowledgeBase.user_id == user_id)
+            select(KnowledgeBase).where(KnowledgeBase.id.in_(list(kb_ids)))
         ).all()
-        mapping = {kb.id: kb.name for kb in rows}
+        mapping = {kb.id: kb.name for kb in rows if kb.id in accessible}
         return [mapping[kb_id] for kb_id in kb_ids if kb_id in mapping]
 
     def ensure_supported_model(self, model: str) -> None:
@@ -272,25 +290,17 @@ class ChatService:
         )
         return self.settings.llm.default_model
 
-    def _validate_kb_ids(self, user_id: int, kb_ids: Sequence[int]) -> list[int]:
-        """校验知识库归属，过滤无效 ID。"""
-        assert self.db is not None
-        valid: list[int] = []
-        for kb_id in kb_ids or []:
-            try:
-                kb = self.db.get(KnowledgeBase, int(kb_id))
-            except (TypeError, ValueError):
-                continue
-            if kb is not None and kb.user_id == user_id:
-                valid.append(kb.id)
-        return valid
+    def _validate_kb_ids(self, kb_ids: Sequence[int]) -> list[int]:
+        """校验知识库可访问性，过滤无效 ID（PermissionService.filter_readable_kb_ids 的薄包装）。"""
+        return self.perm.filter_readable_kb_ids(kb_ids)
 
     # ------------------------------------------------------------------ 流式问答
-    def stream_answer(self, user_id: int, request) -> Iterator[tuple[str, dict]]:
+    def stream_answer(self, request) -> Iterator[tuple[str, dict]]:
         """流式回答问题，产出 (event, data) 事件。
 
         事件顺序：start → retrieval → delta… → done（异常时为 error）。
         本方法自行管理数据库会话，避免长连接期间请求级会话被回收。
+        每次请求进入时再次校验 KB 权限，防止历史会话里的 KB 被取消授权。
         """
         if not self.llm.configured:
             yield "error", {
@@ -300,9 +310,12 @@ class ChatService:
 
         with session_scope() as db:
             session = db.get(ChatSession, request.session_id)
-            if session is None or session.user_id != user_id:
+            if session is None or session.user_id != self.current_user.id:
                 yield "error", {"message": "会话不存在，请刷新后重试"}
                 return
+
+            # 在请求级会话上重新构建 PermissionService（db 已变化）
+            perm = PermissionService(db, self.current_user)
 
             # ---------------- 参数：请求覆盖 + 持久化 ----------------
             if request.model:
@@ -318,7 +331,10 @@ class ChatService:
             if request.retrieval_mode:
                 session.retrieval_mode = request.retrieval_mode
             if request.kb_ids is not None:
-                session.kb_ids = [int(item) for item in request.kb_ids]
+                # 强制只保留用户仍可访问的 KB
+                session.kb_ids = perm.filter_readable_kb_ids([int(item) for item in request.kb_ids])
+            # 再次防御：历史会话里保存的 KB 可能已被取消授权
+            session.kb_ids = perm.filter_readable_kb_ids(session.kb_ids_list)
             db.commit()
 
             question = request.question.strip()

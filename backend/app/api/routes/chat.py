@@ -1,4 +1,4 @@
-"""对话接口：模型参数、会话管理、消息历史、流式问答（SSE）。"""
+"""对话接口：模型参数、会话管理、消息历史、流式问答（SSE，已接入 RBAC）。"""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ _SSE_HEADERS = {
 
 @router.get("/models", summary="可选模型与默认参数")
 def get_models(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001
     service: ChatService = Depends(get_chat_service),
 ) -> dict:
     """返回对话页可选的模型列表与默认推理参数。"""
@@ -47,22 +47,22 @@ def get_models(
 # ============================================================ 会话
 @router.get("/sessions", summary="会话列表")
 def list_sessions(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001
     service: ChatService = Depends(get_chat_service),
 ) -> dict:
     """列出当前用户的全部会话。"""
-    sessions = service.list_sessions(current_user.id)
+    sessions = service.list_sessions()
     return ok([dump(SessionOut(**item)) for item in sessions])
 
 
 @router.post("/sessions", summary="新建会话")
 def create_session(
     payload: SessionCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001
     service: ChatService = Depends(get_chat_service),
 ) -> dict:
     """新建对话会话（可指定名称、知识库与推理参数）。"""
-    session = service.create_session(current_user.id, payload)
+    session = service.create_session(payload)
     data = session_to_dict(session)
     data["kb_names"] = []
     return ok(dump(SessionOut(**data)), "创建成功")
@@ -72,49 +72,48 @@ def create_session(
 def update_session(
     session_id: int,
     payload: SessionUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001
     service: ChatService = Depends(get_chat_service),
 ) -> dict:
-    """更新会话名称、知识库或推理参数。"""
-    session = service.update_session(current_user.id, session_id, payload)
+    """更新会话名称、知识库或推理参数（自动剔除无权限的 KB）。"""
+    session = service.update_session(session_id, payload)
     data = session_to_dict(session)
-    data["kb_names"] = service.kb_names_for(current_user.id, data["kb_ids"])
+    data["kb_names"] = service.kb_names_for(data["kb_ids"])
     return ok(dump(SessionOut(**data)), "更新成功")
 
 
 @router.delete("/sessions/{session_id}", summary="删除会话")
 def delete_session(
     session_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001
     service: ChatService = Depends(get_chat_service),
 ) -> dict:
     """删除会话及其历史消息。"""
-    service.delete_session(current_user.id, session_id)
+    service.delete_session(session_id)
     return ok({"deleted": True}, "删除成功")
 
 
 @router.get("/sessions/{session_id}/messages", summary="会话消息")
 def list_messages(
     session_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001
     service: ChatService = Depends(get_chat_service),
 ) -> dict:
     """读取会话的全部历史消息（含引用来源）。"""
-    messages: list[ChatMessage] = service.list_messages(current_user.id, session_id)
+    messages: list[ChatMessage] = service.list_messages(session_id)
     return ok([dump(MessageOut(**message_to_dict(message))) for message in messages])
 
 
 @router.get("/sessions/{session_id}/export", summary="导出会话（Markdown）")
 def export_session(
     session_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001
     service: ChatService = Depends(get_chat_service),
 ) -> Response:
     """导出会话为 Markdown 文件（含回答、引用来源与推理参数）。"""
-    markdown = service.export_session_markdown(current_user.id, session_id)
-    session = service.get_session(current_user.id, session_id)
+    markdown = service.export_session_markdown(session_id)
+    session = service.get_session(session_id)
     filename = f"{session.name or '对话'}.md"
-    # 文件名做 URL 编码，避免中文在响应头中报错
     return Response(
         content=markdown.encode("utf-8"),
         media_type="text/markdown; charset=utf-8",
@@ -126,11 +125,11 @@ def export_session(
 def feedback_message(
     message_id: int,
     payload: MessageFeedbackUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001
     service: ChatService = Depends(get_chat_service),
 ) -> dict:
     """对助手回答提交反馈：like / dislike / 取消（feedback 传 null）。"""
-    message = service.feedback_message(current_user.id, message_id, payload.feedback)
+    message = service.feedback_message(message_id, payload.feedback)
     return ok(dump(MessageOut(**message_to_dict(message))), "反馈成功")
 
 
@@ -147,16 +146,16 @@ def stream_chat(
     响应为 text/event-stream，事件：start / retrieval / delta / done / error。
     """
     # 先校验会话归属与模型合法性：不通过时直接返回 404 / 400，避免建立无意义的流式连接
-    validator = ChatService(db, cfg)
-    validator.get_session(current_user.id, payload.session_id)
+    validator = ChatService(db, cfg, current_user=current_user)
+    validator.get_session(payload.session_id)
     if payload.model:
         validator.ensure_supported_model(payload.model)
 
-    service = ChatService(None, cfg)
+    service = ChatService(None, cfg, current_user=current_user)
 
     def event_generator():
         try:
-            for event, data in service.stream_answer(current_user.id, payload):
+            for event, data in service.stream_answer(payload):
                 yield sse_event(event, data)
         except Exception as exc:  # noqa: BLE001 - SSE 内部异常统一转 error 事件
             logger.exception("流式问答异常")

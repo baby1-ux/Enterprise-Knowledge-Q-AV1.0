@@ -10,8 +10,9 @@ from ...core.config import Settings, is_placeholder_api_key
 from ...core.logging import get_logger
 from ...db.models import ChatMessage, ChatSession, Chunk, Document, KnowledgeBase, User
 from ...db.session import get_db, healthcheck as db_healthcheck
+from ...services.kb_service import KnowledgeBaseService
 from ...services.vector_store import VectorStoreError, get_vector_store
-from ..deps import get_current_user, get_settings_dep
+from ..deps import get_current_user, get_kb_service, get_settings_dep
 from ..helpers import ok
 
 router = APIRouter(tags=["系统"])
@@ -61,20 +62,26 @@ def health(cfg: Settings = Depends(get_settings_dep)) -> dict:
 def stats(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    service: KnowledgeBaseService = Depends(get_kb_service),
 ) -> dict:
-    """统计当前用户的知识库、文档、分块、会话与消息数量（按用户隔离）。"""
+    """统计当前用户可访问的知识库、文档、分块，以及自己的会话与消息数量（按用户隔离）。"""
     user_id = current_user.id
 
-    kb_count = db.scalar(select(func.count(KnowledgeBase.id)).where(KnowledgeBase.user_id == user_id)) or 0
-    doc_count = db.scalar(select(func.count(Document.id)).where(Document.user_id == user_id)) or 0
-    chunk_count = (
-        db.scalar(
-            select(func.count(Chunk.id))
-            .join(Document, Chunk.document_id == Document.id)
-            .where(Document.user_id == user_id)
-        )
-        or 0
-    )
+    # 知识库 / 文档 / 分块：按「可访问」口径（含被授权与公开的知识库）
+    accessible_kb_ids = service.perm.accessible_kb_ids()
+    kb_count = len(accessible_kb_ids)
+
+    if accessible_kb_ids:
+        doc_count = db.scalar(
+            select(func.count(Document.id)).where(Document.kb_id.in_(accessible_kb_ids))
+        ) or 0
+        chunk_count = db.scalar(
+            select(func.count(Chunk.id)).where(Chunk.kb_id.in_(accessible_kb_ids))
+        ) or 0
+    else:
+        doc_count = 0
+        chunk_count = 0
+
     session_count = db.scalar(select(func.count(ChatSession.id)).where(ChatSession.user_id == user_id)) or 0
 
     message_stats = db.execute(

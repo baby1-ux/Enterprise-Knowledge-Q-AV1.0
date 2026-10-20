@@ -11,7 +11,7 @@ from ..core.errors import NotFoundError, ValidationError
 from ..core.logging import get_logger
 from ..core.rate_limit import login_throttle
 from ..core.security import create_access_token, hash_password, verify_password
-from ..db.models import User
+from ..db.models import Role, User, UserRole
 from ..schemas.common import format_datetime
 
 logger = get_logger("auth_service")
@@ -23,6 +23,18 @@ def user_to_dict(user: User) -> dict:
         "id": user.id,
         "username": user.username,
         "created_at": format_datetime(user.created_at),
+    }
+
+
+def user_to_profile(user: User, db: Session) -> dict:
+    """带角色信息的用户资料（用于 /api/auth/me）。"""
+    from .permission_service import PermissionService
+
+    perm = PermissionService(db, user)
+    return {
+        **user_to_dict(user),
+        "roles": perm.role_codes(),
+        "is_admin": perm.is_admin(),
     }
 
 
@@ -63,10 +75,27 @@ class AuthService:
 
         user = User(username=username, password_hash=hash_password(password))
         self.db.add(user)
+        self.db.flush()  # 拿到 user.id 以便绑定角色
+
+        # 默认授予 viewer 角色；若账号命中 admin_usernames 名单，同步授予 admin
+        self._assign_default_roles(user, is_admin=username in self.settings.app.admin_usernames)
+
         self.db.commit()
         self.db.refresh(user)
-        logger.info("用户注册成功：id=%s username=%s", user.id, user.username)
+        logger.info(
+            "用户注册成功：id=%s username=%s is_admin=%s",
+            user.id,
+            user.username,
+            username in self.settings.app.admin_usernames,
+        )
         return user
+
+    def _assign_default_roles(self, user: User, *, is_admin: bool) -> None:
+        """为新用户绑定默认角色：viewer 必有，admin 视配置。"""
+        code_list = ["admin", "viewer"] if is_admin else ["viewer"]
+        roles = self.db.scalars(select(Role).where(Role.code.in_(code_list))).all()
+        for role in roles:
+            self.db.add(UserRole(user_id=user.id, role_id=role.id))
 
     def login(self, username: str, password: str, captcha_id: str, captcha_code: str) -> tuple[User, str]:
         """用户登录，返回 (用户, 令牌)。"""

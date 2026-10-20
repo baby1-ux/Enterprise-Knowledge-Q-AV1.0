@@ -15,6 +15,7 @@
 - `code = 0` 表示成功；非 0 表示业务/HTTP 错误（与 HTTP 状态码一致，如 400、401、404、500）。
 - 校验错误（422）同样返回该结构，`data.detail` 为字段错误列表。
 - 鉴权失败返回 HTTP 401，`message` 形如 `登录已过期，请重新登录`。
+- 权限不足返回 HTTP 403，`message` 形如 `无权访问知识库「xxx」`；私有知识库返回 404（不暴露存在性）。
 
 ## 2. 鉴权
 
@@ -82,11 +83,16 @@ Authorization: Bearer <access_token>
 ```json
 { "code": 0, "message": "ok", "data": [
   { "id": 1, "name": "产品手册", "description": "产品说明书合集",
+    "retrieval_mode": "hybrid", "visibility": "private", "owner_id": 1,
+    "access_type": "owner", "can_write": true,
     "doc_count": 3, "chunk_count": 128, "created_at": "2026-07-10 10:00:00" }
 ] }
 ```
 
 - `keyword` 按知识库名称模糊搜索（可选，为空返回全部）。
+- 只返回**当前用户可访问**的知识库：本人所有（`access_type=owner`）+ 角色授权（`role`）+ 人员直授（`member`）+ 全员可见（`visibility=all`）；管理员额外可见全部。
+- `can_write=false` 表示仅有只读权限（可检索/查看，不能上传/编辑/删除）。
+- `visibility` 取值：`private`（仅所有者）/ `role`（被授权角色可读）/ `all`（全员只读）。
 
 ### 3.2 创建知识库
 
@@ -363,3 +369,78 @@ data: {"message":"大模型调用失败：……"}
 | `today_answer_count` | 今日回答数（以数据库服务器时钟界定「今天」，按用户隔离） |
 
 - 所有计数按当前登录用户隔离，其它用户的数据不计入。
+- `knowledge_base_count` / `document_count` / `chunk_count` 按「可访问」口径统计（含被授权与全员可见的知识库）。
+
+## 9. 角色与权限管理（RBAC）
+
+### 9.1 模型说明
+
+| 表 | 说明 |
+| --- | --- |
+| `roles` | 角色（系统内置 `admin`/`staff`/`viewer`，支持自定义） |
+| `user_roles` | 用户-角色绑定（多对多） |
+| `kb_roles` | 知识库-角色授权（`can_read` / `can_write`） |
+| `kb_members` | 知识库单用户直授（解决「只给某一个人」的零散场景） |
+| `knowledge_bases.visibility` | `private`（仅所有者）/ `role`（被授权角色可读）/ `all`（全员只读） |
+
+权限判定优先级：**admin 角色 > 所有者 > 角色授权 > 人员直授 > 可见范围（all）**。
+
+- 旧库升级后所有知识库默认 `private`，存量用户自动补发 `viewer` 角色（`init_db` 自动完成，零手工迁移）。
+- 注册时新用户默认获得 `viewer`；命中 `config.app.admin_usernames` 名单的账号同步获得 `admin`。
+
+### 9.2 当前用户信息（含角色）
+
+`GET /api/auth/me`
+
+```json
+{ "code": 0, "message": "ok", "data": {
+  "id": 1, "username": "admin01", "created_at": "2026-07-10 09:00:00",
+  "roles": ["admin", "viewer"], "is_admin": true
+} }
+```
+
+### 9.3 角色管理（仅 admin）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/admin/roles` | 角色列表（含 `user_count`、`kb_count`） |
+| POST | `/api/admin/roles` | 创建角色 `{"code":"sales","name":"销售组","description":""}` |
+| PUT | `/api/admin/roles/{role_id}` | 更新角色名称/说明（`code` 不可变） |
+| DELETE | `/api/admin/roles/{role_id}` | 删除自定义角色（内置角色返回 400） |
+| PUT | `/api/admin/roles/{role_id}/kbs` | 为角色批量分配知识库（覆盖式） |
+
+```json
+// PUT /api/admin/roles/{role_id}/kbs
+{ "grants": [ { "kb_id": 1, "can_read": true, "can_write": false }, { "kb_id": 2, "can_read": true, "can_write": true } ] }
+```
+
+### 9.4 用户角色分配（仅 admin）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/admin/users` | 用户列表（含 `roles`、`is_admin`、`kb_count`） |
+| PUT | `/api/admin/users/{user_id}/roles` | 为用户分配角色（覆盖式，至少保留一个角色） |
+
+```json
+// PUT /api/admin/users/{user_id}/roles
+{ "role_ids": [2] }
+```
+
+### 9.5 知识库授权（所有者或 admin）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/admin/kb/{kb_id}/permission` | 查看授权明细 |
+| PUT | `/api/admin/kb/{kb_id}/permission` | 更新授权（覆盖式：未列出的授权将被移除） |
+
+```json
+// PUT /api/admin/kb/{kb_id}/permission
+{
+  "role_grants": [ { "role_id": 2, "can_read": true, "can_write": false } ],
+  "member_grants": [ { "user_id": 5, "can_read": true, "can_write": true } ]
+}
+```
+
+- 返回 `data` 含 `visibility`、`roles`（角色授权明细）、`members`（人员直授明细）。
+- 非管理员调用第 9.3 / 9.4 节接口返回 HTTP 403。
+- 删除知识库会自动清理引用它的会话配置；被收回权限后，历史会话再次提问时自动剔除该 KB（不报错）。

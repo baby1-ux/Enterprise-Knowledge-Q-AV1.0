@@ -16,6 +16,7 @@
 | 模块 | 能力 |
 | --- | --- |
 | 账号体系 | 注册（4 字段：账号/密码/确认密码/图形验证码）、登录（3 字段）、图形验证码（一次性、5 分钟有效）、JWT 登录态、**登录防爆破**（同一账号连续失败 5 次锁定 10 分钟，验证码错误不连坐） |
+| 权限体系（RBAC） | **角色-知识库授权**：`admin`/`staff`/`viewer` 系统角色 + 自定义角色；知识库三档可见范围（私有 / 角色共享 / 全员只读）+ 人员直授；不同身份只能检索自己可访问的知识库；管理员可统一管理角色与授权 |
 | 知识库 | 多知识库；**名称关键字搜索**；文档列表；删除级联清理分块与向量；每库默认检索方式 |
 | 文档解析 | PDF、PPTX、Markdown、TXT、DOCX、图片（OCR）；按页/按标题保留来源位置；**批量上传**（单次最多 20 个，单文件失败不影响其它） |
 | 切块 | 中文友好的句子级切块，可配置切块大小与重叠大小（100~2000 / 0 ≤ overlap < size） |
@@ -172,6 +173,7 @@ npm run dev                   # http://127.0.0.1:5173（/api 代理到 8000）
 | 分块 | `GET /api/kb/documents/{id}/chunks`、`GET /api/kb/chunks/search`（跨库搜索）、`PUT/DELETE /api/kb/chunks/{id}`、`PUT /api/kb/chunks/{id}/enabled` |
 | 对话 | `GET /api/chat/models`、`/api/chat/sessions...`、`POST /api/chat/stream`（SSE）、`GET /api/chat/sessions/{id}/export`（导出 Markdown）、`PUT /api/chat/messages/{id}/feedback`（赞/踩） |
 | 系统 | `GET /api/health`、`GET /api/system/stats`（用量统计） |
+| 权限管理 | `GET/POST/PUT/DELETE /api/admin/roles`、`PUT /api/admin/roles/{id}/kbs`、`GET /api/admin/users`、`PUT /api/admin/users/{id}/roles`、`GET/PUT /api/admin/kb/{id}/permission`（详见 `docs/API.md` 第 9 节） |
 
 SSE 事件：`start` → `retrieval` → `delta`… → `done`（异常为 `error`）。
 
@@ -185,7 +187,7 @@ python -m pytest tests/ -v                            # 全部用例（SQLite + 
 python -m pytest tests/ -v -m "not integration"       # 排除集成用例
 ```
 
-**最近一次实测结果：172 个用例，170 passed、2 skipped（集成用例默认跳过），耗时约 32s。**
+**最近一次实测结果：195 个用例，193 passed、2 skipped（集成用例默认跳过），耗时约 85s。**
 
 上线前的真实链路自检（会真实调用接口，消耗额度）：
 
@@ -228,6 +230,10 @@ $env:RAG_DEMO_EXPOSE_CAPTCHA = "1"   # 需用该环境变量重启后端，脚�
 | `tests/test_kb_api.py` | 知识库 CRUD、上传入库、分块分页/编辑/启停/删除、越权隔离 |
 | `tests/test_chat_api.py` | 模型参数、会话 CRUD、SSE 事件顺序、历史轮数、引用来源、404/422 |
 | `tests/test_llm_client.py` | DeepSeek 请求体构造、推理模型省略采样参数、Key 占位识别、模型列表 |
+| `tests/test_permission.py` | 权限矩阵：私有 404、全员只读、角色授权读/写、人员直授、admin 旁路、会话过滤越权 KB |
+| `tests/test_kb_visibility.py` | 可见性隔离：知识库列表按权限过滤、只读用户上传 403、跨库搜索隔离、统计按可访问口径、/me 返回角色 |
+| `tests/test_admin_rbac_api.py` | 管理接口：非 admin 403、角色 CRUD、内置角色禁删、用户角色分配、KB 授权明细 |
+| `tests/test_rbac_migration.py` | 升级迁移：默认角色种子、存量用户回填 viewer、重复初始化幂等 |
 | `tests/test_feedback_export.py` | 消息点赞/点踩/取消、反馈边界（用户消息/非法值/越权）、会话导出 Markdown 内容 |
 | `tests/test_login_throttle.py` | 登录连续失败锁定、成功重置计数、验证码错误不连坐、锁定过期恢复 |
 | `tests/test_system_stats.py` | 统计接口空数据/使用后计数、鉴权、按用户隔离 |
@@ -281,7 +287,9 @@ $env:RAG_DEMO_EXPOSE_CAPTCHA = "1"   # 需用该环境变量重启后端，脚�
 7. **流式回答不输出**：检查 `DEEPSEEK_API_KEY` 是否正确（对话）+ `DASHSCOPE_API_KEY` 是否有效（向量化）；接口会以 `error` 事件返回中文原因。
 8. **上传后解析失败提示未配置 DashScope Key**：向量化仍依赖 DashScope；如只用 DeepSeek 一个 Key，可把 `embedding.provider` 改为 `local_bge_m3`（需下载模型）或 `hash`（仅演示，语义检索能力弱）。
 9. **登录提示「登录失败次数过多，账号已锁定」**：同一账号连续输错 5 次密码会锁定 10 分钟（`config.yaml -> app.login_max_attempts` / `app.login_lock_minutes` 可调整，重启服务也会立即解锁）；验证码输错不计入失败次数。
-10. **升级后启动报「Unknown column」**：新版本启动时会自动为已有数据表补充新增列（如 `chat_messages.feedback`），一般无需手工处理；若自动补列失败，可按日志中的表名/列名手工执行 `ALTER TABLE`。
+10. **升级后启动报「Unknown column」**：新版本启动时会自动为已有数据表补充新增列（如 `chat_messages.feedback`、`knowledge_bases.visibility`），一般无需手工处理；若自动补列失败，可按日志中的表名/列名手工执行 `ALTER TABLE`。
+11. **升级后看不到别人共享的知识库**：RBAC 升级后存量知识库默认 `private`（仅所有者可见），需所有者（或管理员）在知识库卡片「权限」中设置可见范围与角色授权。
+12. **想给自己加管理员**：在 `config.yaml -> app.admin_usernames` 写入账号名后重启服务，该账号**重新注册**（或由已有管理员在「系统管理 → 用户管理」中授予 `admin` 角色）即可。
 
 ---
 

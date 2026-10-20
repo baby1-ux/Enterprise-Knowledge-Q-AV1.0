@@ -14,6 +14,8 @@ export const useAuthStore = defineStore('auth', () => {
 
   const isLoggedIn = computed(() => Boolean(token.value))
   const username = computed(() => user.value?.username || '用户')
+  const roles = computed(() => user.value?.roles || [])
+  const isAdmin = computed(() => Boolean(user.value?.is_admin))
 
   /** 登录：成功后写入 token 与用户信息 */
   async function login(payload) {
@@ -55,5 +57,5 @@ export const useAuthStore = defineStore('auth', () => {
     clearAuth()
   }
 
-  return { token, user, loading, isLoggedIn, username, login, register, loadCurrentUser, logout }
+  return { token, user, loading, isLoggedIn, username, roles, isAdmin, login, register, loadCurrentUser, logout }
 })

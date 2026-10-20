@@ -28,6 +28,8 @@ app:
   max_upload_size_mb: 50                     # 单个文件最大体积
   login_max_attempts: 5                      # 同一账号连续登录失败次数上限，达到后锁定账号
   login_lock_minutes: 10                     # 锁定时长（分钟），仅「账号或密码错误」计入失败
+  # 注册即授予 admin 角色的账号（首部署引导），生产环境请删除或替换为真实管理员账号
+  admin_usernames: []
   allowed_extensions: [".pdf", ".ppt", ".pptx", ".md", ".markdown", ".txt", ".docx", ".png", ".jpg", ".jpeg", ".bmp", ".webp"]
 
 # ---------------------------------------------------------------------------

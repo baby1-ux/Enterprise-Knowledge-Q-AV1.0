@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { getToken } from '@/api/request'
+import { useAuthStore } from '@/stores/auth'
 import MainLayout from '@/layouts/MainLayout.vue'
 
 /**
@@ -48,6 +49,12 @@ const routes = [
         name: 'kb-chunks',
         component: () => import('@/views/KbChunksView.vue'),
         meta: { requiresAuth: true, title: '分块预览' }
+      },
+      {
+        path: 'admin',
+        name: 'admin',
+        component: () => import('@/views/AdminView.vue'),
+        meta: { requiresAuth: true, requiresAdmin: true, title: '系统管理' }
       }
     ]
   },
@@ -64,7 +71,7 @@ const router = createRouter({
   scrollBehavior: () => ({ top: 0 })
 })
 
-/** 全局守卫：登录态校验 + 已登录禁止访问登录/注册页 */
+/** 全局守卫：登录态校验 + 已登录禁止访问登录/注册页 + 管理员守卫 */
 router.beforeEach((to) => {
   const hasToken = Boolean(getToken())
 
@@ -74,6 +81,14 @@ router.beforeEach((to) => {
 
   if (to.meta?.guestOnly && hasToken) {
     return { path: '/chat' }
+  }
+
+  if (to.meta?.requiresAdmin) {
+    // 异步守卫：拉取一次当前用户角色（pinia 已在登录时缓存）
+    const auth = useAuthStore()
+    if (!auth.isAdmin) {
+      return { path: '/chat' }
+    }
   }
 
   return true

@@ -54,12 +54,19 @@ class UserOut(TimestampSchema):
     created_at: str | None = None
 
 
+class UserProfileOut(UserOut):
+    """当前用户信息（含角色与管理员标识）。"""
+
+    roles: list[str] = Field(default_factory=list, description="用户拥有的角色代码列表")
+    is_admin: bool = Field(default=False, description="是否管理员")
+
+
 class LoginData(BaseModel):
     """登录成功返回。"""
 
     access_token: str
     token_type: str = "bearer"
-    user: UserOut
+    user: UserProfileOut
 
 
 class UserRegisterOut(ORMSchema):

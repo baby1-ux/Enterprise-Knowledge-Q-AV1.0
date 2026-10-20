@@ -8,12 +8,14 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
     String,
     Text,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -31,6 +33,9 @@ class User(Base, TimestampMixin):
 
     knowledge_bases: Mapped[list["KnowledgeBase"]] = relationship(
         back_populates="owner", cascade="all, delete-orphan", lazy="selectin"
+    )
+    role_links: Mapped[list["UserRole"]] = relationship(
+        cascade="all, delete-orphan", passive_deletes=True, lazy="selectin"
     )
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
@@ -50,6 +55,10 @@ class KnowledgeBase(Base, TimestampMixin):
     embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="向量维度")
     retrieval_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="hybrid", comment="默认检索方式 dense/hybrid"
+    )
+    visibility: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="private", server_default="private",
+        comment="可见范围 private/role/all"
     )
 
     owner: Mapped[User] = relationship(back_populates="knowledge_bases")
@@ -181,4 +190,95 @@ class ChatMessage(Base, TimestampMixin):
         return f"<ChatMessage id={self.id} role={self.role!r}>"
 
 
-__all__ = ["User", "KnowledgeBase", "Document", "Chunk", "ChatSession", "ChatMessage"]
+__all__ = [
+    "User",
+    "UserRole",
+    "Role",
+    "KnowledgeBase",
+    "KnowledgeBaseRole",
+    "KnowledgeBaseMember",
+    "Document",
+    "Chunk",
+    "ChatSession",
+    "ChatMessage",
+]
+
+
+# ============================== RBAC 模型 ==============================
+
+
+class Role(Base, TimestampMixin):
+    """角色表：系统内置 admin/staff/viewer，亦支持自定义角色。"""
+
+    __tablename__ = "roles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, comment="角色代码（admin/staff/viewer/...）")
+    name: Mapped[str] = mapped_column(String(64), nullable=False, comment="角色名")
+    description: Mapped[str] = mapped_column(String(255), nullable=False, default="", comment="角色说明")
+    is_system: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, comment="系统内置角色不可删除", server_default="0"
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<Role id={self.id} code={self.code!r}>"
+
+
+class UserRole(Base):
+    """用户-角色绑定（多对多）。"""
+
+    __tablename__ = "user_roles"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    role_id: Mapped[int] = mapped_column(
+        ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[Any] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), comment="授权时间"
+    )
+
+
+class KnowledgeBaseRole(Base):
+    """知识库-角色授权（多对多 + 操作权限位）。"""
+
+    __tablename__ = "kb_roles"
+
+    kb_id: Mapped[int] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), primary_key=True
+    )
+    role_id: Mapped[int] = mapped_column(
+        ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True
+    )
+    can_read: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1", comment="可检索/查看"
+    )
+    can_write: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0", comment="可上传/编辑/删除"
+    )
+    created_at: Mapped[Any] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), comment="授权时间"
+    )
+
+
+class KnowledgeBaseMember(Base):
+    """知识库单用户直授（解决「只给某一个人」的零散场景）。"""
+
+    __tablename__ = "kb_members"
+
+    kb_id: Mapped[int] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    can_read: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1", comment="可检索/查看"
+    )
+    can_write: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0", comment="可上传/编辑/删除"
+    )
+    created_at: Mapped[Any] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), comment="授权时间"
+    )

@@ -123,7 +123,87 @@ def init_db(cfg: Settings | None = None) -> None:
     import_models()
     Base.metadata.create_all(bind=engine)
     _migrate_missing_columns(engine)
+    _backfill_kb_visibility(engine)
+    ensure_default_roles(engine)
+    ensure_all_users_have_default_role(engine)
     logger.info("数据库表初始化完成：%s", ", ".join(sorted(Base.metadata.tables)))
+
+
+def _backfill_kb_visibility(engine) -> None:
+    """升级兼容：把 visibility 为 NULL / 空串的存量知识库回填为 private。
+
+    SQLAlchemy 的列级 default 只在 ORM INSERT 时生效，ALTER TABLE ADD COLUMN
+    不会给历史行赋值；这里显式 UPDATE，保证旧库升级后语义与方案一致。
+    """
+    with engine.begin() as connection:
+        result = connection.execute(
+            text(
+                "UPDATE knowledge_bases SET visibility = 'private' "
+                "WHERE visibility IS NULL OR visibility = ''"
+            )
+        )
+    if result.rowcount:
+        logger.info("回填存量知识库可见范围为 private：%s 条", result.rowcount)
+
+
+# 内置角色定义（启动时幂等插入 / 升级时补齐）
+_DEFAULT_ROLES: tuple[tuple[str, str, str, bool], ...] = (
+    ("admin", "管理员", "可访问与管理系统全部资源，包含角色与知识库授权管理", True),
+    ("staff", "业务人员", "可访问被授权的知识库，进行检索与日常问答", True),
+    ("viewer", "访客", "默认角色：仅可访问公开（visibility=all）知识库与被授权的私有库", True),
+)
+
+
+def ensure_default_roles(engine) -> None:
+    """幂等插入三个系统内置角色，重复执行不会报错。"""
+    from sqlalchemy import select
+
+    from .models import Role
+
+    with engine.begin() as connection:
+        existing_codes = set(
+            connection.execute(select(Role.code)).scalars().all()
+        )
+        for code, name, description, is_system in _DEFAULT_ROLES:
+            if code in existing_codes:
+                # 已存在：仅刷新 name/description（code 不可变）
+                connection.execute(
+                    Role.__table__.update()
+                    .where(Role.code == code)
+                    .values(name=name, description=description)
+                )
+                continue
+            connection.execute(
+                Role.__table__.insert().values(
+                    code=code, name=name, description=description, is_system=is_system
+                )
+            )
+
+
+def ensure_all_users_have_default_role(engine) -> None:
+    """为所有没有角色的存量用户补发 viewer 默认角色（升级兼容）。"""
+    from sqlalchemy import select
+
+    from .models import Role, User, UserRole
+
+    with session_scope() as session:
+        viewer = session.scalar(select(Role).where(Role.code == "viewer"))
+        if viewer is None:
+            return  # 上面 ensure_default_roles 已保证，但为兼容 race 兜底
+
+        existing_pairs = {
+            (row.user_id, row.role_id)
+            for row in session.execute(select(UserRole.user_id, UserRole.role_id)).all()
+        }
+        all_users = session.scalars(select(User.id)).all()
+        missing = [uid for uid in all_users if (uid, viewer.id) not in existing_pairs]
+        if not missing:
+            return
+
+        for uid in missing:
+            session.add(UserRole(user_id=uid, role_id=viewer.id))
+        session.commit()
+        logger.info("为 %s 个存量用户补发默认角色 viewer", len(missing))
 
 
 def _existing_columns(connection, table_name: str, is_sqlite: bool) -> set[str] | None:
@@ -169,7 +249,14 @@ def _column_ddl(column, is_sqlite: bool) -> str:
     else:  # pragma: no cover - 未知类型按文本兜底
         ddl_type = "TEXT"
     nullable = "NULL" if column.nullable else "NOT NULL"
-    return f"ADD COLUMN `{column.name}` {ddl_type} {nullable}"
+    # 带上 server_default，补列时历史行与新行都有正确的默认值
+    # （列级 default 只在 ORM INSERT 时生效，DDL 默认值需要单独声明）
+    default_clause = ""
+    server_default = getattr(column, "server_default", None)
+    default_arg = getattr(server_default, "arg", None)
+    if default_arg:
+        default_clause = f" DEFAULT {default_arg}"
+    return f"ADD COLUMN `{column.name}` {ddl_type} {nullable}{default_clause}"
 
 
 def _migrate_missing_columns(engine) -> None:
