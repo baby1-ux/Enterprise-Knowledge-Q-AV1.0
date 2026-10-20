@@ -1,0 +1,239 @@
+"""知识库接口：知识库管理、文档上传解析、分块预览编辑。"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile
+from sqlalchemy.orm import Session
+
+from ...core.config import Settings
+from ...core.errors import ValidationError
+from ...core.logging import get_logger
+from ...db.models import User
+from ...schemas.kb import (
+    ChunkEnabledUpdate,
+    ChunkOut,
+    ChunkPageOut,
+    ChunkUpdate,
+    DocumentOut,
+    DocumentStatusOut,
+    KnowledgeBaseCreate,
+    KnowledgeBaseOut,
+    KnowledgeBaseUpdate,
+)
+from ...services.kb_service import (
+    KnowledgeBaseService,
+    chunk_to_dict,
+    document_to_dict,
+    ingest_documents,
+    knowledge_base_to_dict,
+)
+from ..deps import get_current_user, get_kb_service, get_settings_dep
+from ..helpers import dump, ok
+
+router = APIRouter(prefix="/kb", tags=["知识库"])
+logger = get_logger("api.kb")
+
+
+# ============================================================ 知识库
+@router.get("", summary="知识库列表")
+@router.get("/", summary="知识库列表")
+def list_knowledge_bases(
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """列出当前用户的知识库。"""
+    items = service.list_knowledge_bases(current_user.id)
+    return ok([dump(KnowledgeBaseOut(**item)) for item in items])
+
+
+@router.post("", summary="创建知识库")
+@router.post("/", summary="创建知识库")
+def create_knowledge_base(
+    payload: KnowledgeBaseCreate,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """新建知识库。"""
+    kb = service.create_knowledge_base(
+        user_id=current_user.id,
+        name=payload.name,
+        description=payload.description,
+        retrieval_mode=payload.retrieval_mode,
+    )
+    doc_count, chunk_count = service.document_counts(kb.id)
+    return ok(dump(KnowledgeBaseOut(**knowledge_base_to_dict(kb, doc_count, chunk_count))), "创建成功")
+
+
+@router.put("/{kb_id}", summary="更新知识库")
+def update_knowledge_base(
+    kb_id: int,
+    payload: KnowledgeBaseUpdate,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """修改知识库名称/描述/默认检索方式。"""
+    kb = service.update_knowledge_base(
+        user_id=current_user.id,
+        kb_id=kb_id,
+        name=payload.name,
+        description=payload.description,
+        retrieval_mode=payload.retrieval_mode,
+    )
+    doc_count, chunk_count = service.document_counts(kb.id)
+    return ok(dump(KnowledgeBaseOut(**knowledge_base_to_dict(kb, doc_count, chunk_count))), "更新成功")
+
+
+@router.delete("/{kb_id}", summary="删除知识库")
+def delete_knowledge_base(
+    kb_id: int,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """删除知识库及其全部文档与向量。"""
+    service.delete_knowledge_base(current_user.id, kb_id)
+    return ok({"deleted": True}, "删除成功")
+
+
+# ============================================================ 文档
+@router.get("/{kb_id}/documents", summary="文档列表")
+def list_documents(
+    kb_id: int,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """列出知识库下的文档及解析状态。"""
+    documents = service.list_documents(current_user.id, kb_id)
+    return ok([dump(DocumentOut(**document_to_dict(document))) for document in documents])
+
+
+@router.post("/{kb_id}/documents", summary="上传并解析文档")
+async def upload_document(
+    kb_id: int,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="待解析的文件"),
+    chunk_size: int = Form(500, description="切块大小"),
+    chunk_overlap: int = Form(50, description="重叠大小"),
+    retrieval_mode: str = Form("hybrid", description="dense / hybrid"),
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+    cfg: Settings = Depends(get_settings_dep),
+) -> dict:
+    """上传文档，后台自动解析、切块并写入向量库。"""
+    if chunk_size < 100 or chunk_size > 2000:
+        raise ValidationError("切块大小需在 100~2000 之间")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValidationError("重叠大小需大于等于 0 且小于切块大小")
+    if retrieval_mode not in ("dense", "hybrid"):
+        raise ValidationError("检索方式仅支持 dense 或 hybrid")
+
+    content = await file.read()
+    document = service.create_document(
+        user_id=current_user.id,
+        kb_id=kb_id,
+        filename=file.filename or "未命名文件",
+        content=content,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        retrieval_mode=retrieval_mode,
+    )
+    background_tasks.add_task(ingest_documents, [document.id], cfg)
+    logger.info("文档已加入解析队列：id=%s filename=%s", document.id, document.filename)
+    return ok(dump(DocumentOut(**document_to_dict(document))), "上传成功，正在后台解析")
+
+
+@router.get("/documents/{doc_id}/status", summary="解析进度")
+def get_document_status(
+    doc_id: int,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """查询文档解析状态，供前端轮询。"""
+    document = service.get_document(current_user.id, doc_id)
+    data = DocumentStatusOut(
+        id=document.id,
+        status=document.status,
+        chunk_count=document.chunk_count,
+        error_message=document.error_message or "",
+    )
+    return ok(dump(data))
+
+
+@router.post("/documents/{doc_id}/reparse", summary="重新解析文档")
+def reparse_document(
+    doc_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+    cfg: Settings = Depends(get_settings_dep),
+) -> dict:
+    """清空旧分块并重新解析文档。"""
+    document = service.reparse_document(current_user.id, doc_id)
+    background_tasks.add_task(ingest_documents, [document.id], cfg)
+    return ok(dump(DocumentOut(**document_to_dict(document))), "已开始重新解析")
+
+
+@router.delete("/documents/{doc_id}", summary="删除文档")
+def delete_document(
+    doc_id: int,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """删除文档及其分块与向量。"""
+    service.delete_document(current_user.id, doc_id)
+    return ok({"deleted": True}, "删除成功")
+
+
+# ============================================================ 分块
+@router.get("/documents/{doc_id}/chunks", summary="分块分页列表")
+def list_chunks(
+    doc_id: int,
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(10, ge=1, le=100, description="每页数量"),
+    keyword: str = Query("", description="内容关键字"),
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """分页查看文档分块，支持关键字检索。"""
+    total, chunks = service.list_chunks(current_user.id, doc_id, page=page, page_size=page_size, keyword=keyword)
+    data = ChunkPageOut(
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=[ChunkOut(**chunk_to_dict(chunk)) for chunk in chunks],
+    )
+    return ok(dump(data))
+
+
+@router.put("/chunks/{chunk_id}", summary="编辑分块")
+def update_chunk(
+    chunk_id: int,
+    payload: ChunkUpdate,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """修改分块内容并重新向量化。"""
+    chunk = service.update_chunk(current_user.id, chunk_id, payload.content)
+    return ok(dump(ChunkOut(**chunk_to_dict(chunk))), "保存成功")
+
+
+@router.put("/chunks/{chunk_id}/enabled", summary="启停分块")
+def set_chunk_enabled(
+    chunk_id: int,
+    payload: ChunkEnabledUpdate,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """启用或禁用分块（禁用后不参与检索）。"""
+    chunk = service.set_chunk_enabled(current_user.id, chunk_id, payload.enabled)
+    return ok(dump(ChunkOut(**chunk_to_dict(chunk))), "已更新")
+
+
+@router.delete("/chunks/{chunk_id}", summary="删除分块")
+def delete_chunk(
+    chunk_id: int,
+    current_user: User = Depends(get_current_user),
+    service: KnowledgeBaseService = Depends(get_kb_service),
+) -> dict:
+    """删除分块及其向量。"""
+    service.delete_chunk(current_user.id, chunk_id)
+    return ok({"deleted": True}, "删除成功")

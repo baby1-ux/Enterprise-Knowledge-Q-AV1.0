@@ -1,0 +1,162 @@
+# ============================================================================
+# 企业内容知识问答系统（RAG）主配置文件
+# 说明：所有重要的可变信息集中在此文件，支持 ${环境变量} 或 ${环境变量:-默认值} 占位。
+#       修改后重启后端服务生效。
+#
+# 模型分工（重要）：
+#   对话生成 → DeepSeek（deepseek-chat / deepseek-reasoner）
+#   文本向量化、重排、图片 OCR → DashScope（DeepSeek 暂不提供向量化与 OCR 接口）
+#   因此需要准备两个 API Key：DEEPSEEK_API_KEY、DASHSCOPE_API_KEY
+# ============================================================================
+
+app:
+  name: "企业内容知识问答系统"
+  version: "1.0.0"
+  host: "0.0.0.0"
+  port: 8000
+  debug: true
+  # JWT 签名密钥，生产环境请务必修改为随机长字符串
+  secret_key: "rag-qa-system-please-change-this-secret-key-in-production"
+  access_token_expire_minutes: 1440          # 登录态有效期（分钟），默认 1 天
+  cors_origins:
+    - "http://localhost:5173"
+    - "http://127.0.0.1:5173"
+  # 文件与日志目录（相对项目根目录）
+  upload_dir: "data/uploads"
+  log_dir: "logs"
+  log_level: "INFO"
+  max_upload_size_mb: 50                     # 单个文件最大体积
+  allowed_extensions: [".pdf", ".ppt", ".pptx", ".md", ".markdown", ".txt", ".docx", ".png", ".jpg", ".jpeg", ".bmp", ".webp"]
+
+# ---------------------------------------------------------------------------
+# MySQL：用户、知识库、文档、分块、会话等业务数据
+# ---------------------------------------------------------------------------
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: "${MYSQL_PASSWORD:-123456}"
+  database: "rag_qa"
+  charset: "utf8mb4"
+  pool_size: 10
+  max_overflow: 20
+  pool_pre_ping: true
+  echo: false
+  # 测试环境可用 SQLite 覆盖，例如：sqlite:///./data/test.db
+  url_override: ""
+
+# ---------------------------------------------------------------------------
+# Milvus：分块向量库（稠密向量 + BM25 稀疏向量）
+# ---------------------------------------------------------------------------
+milvus:
+  host: "${MILVUS_HOST:-127.0.0.1}"
+  port: 19530
+  user: ""
+  password: ""
+  database: "rag_qa"                         # Milvus 数据库名，不存在会自动创建
+  collection: "rag_chunks"                   # 分块向量集合
+  # milvus = 使用 Milvus 向量库；memory = 内存向量库（无需部署，便于本地演示与单测）
+  provider: "milvus"
+  index_type: "HNSW"
+  metric_type: "COSINE"
+  hnsw_m: 16
+  hnsw_ef_construction: 200
+  search_ef: 64
+
+# ---------------------------------------------------------------------------
+# 文本向量化（DashScope 通义千问向量模型）
+# ---------------------------------------------------------------------------
+embedding:
+  # dashscope = 调用 DashScope 向量模型（默认，无需本地模型文件）
+  # local_bge_m3 = 本地 BGE-M3（需下载模型，见 model_path）
+  # hash = 离线哈希向量（无需任何 Key，仅用于本地演示与单元测试）
+  provider: "dashscope"
+  model: "text-embedding-v4"
+  dimension: 1024
+  batch_size: 10
+  timeout: 30
+  max_retries: 3
+  # DashScope 原生 API 地址（向量化 / 重排 / OCR 共用）
+  base_url: "https://dashscope.aliyuncs.com/api/v1"
+  # 请填写你自己的 DashScope API Key（也支持环境变量 DASHSCOPE_API_KEY 覆盖）
+  api_key: "${DASHSCOPE_API_KEY:-sk-请替换为你的DashScope-API-Key}"
+  model_path: "models/bge-m3"
+
+# ---------------------------------------------------------------------------
+# 检索结果重排（Rerank）
+# ---------------------------------------------------------------------------
+rerank:
+  enabled: false                             # 默认关闭，开启后对召回结果重排
+  provider: "dashscope"                      # dashscope | local_bge
+  model: "gte-rerank-v2"
+  base_url: "https://dashscope.aliyuncs.com/api/v1"
+  api_key: "${DASHSCOPE_API_KEY:-sk-请替换为你的DashScope-API-Key}"
+  model_path: "models/bge-reranker-v2-m3"
+  top_n: 6
+  timeout: 30
+
+# ---------------------------------------------------------------------------
+# 对话大模型（DeepSeek，OpenAI 兼容接口）
+# ---------------------------------------------------------------------------
+llm:
+  provider: "deepseek"
+  # 请填写你自己的 DeepSeek API Key（也支持环境变量 DEEPSEEK_API_KEY 覆盖）
+  api_key: "${DEEPSEEK_API_KEY:-sk-请替换为你的DeepSeek-API-Key}"
+  base_url: "https://api.deepseek.com/v1"
+  default_model: "deepseek-chat"
+  timeout: 120
+  models:
+    - value: "deepseek-chat"
+      label: "DeepSeek-Chat"
+      description: "通用对话模型（V3），响应快，适合绝大多数问答"
+    - value: "deepseek-reasoner"
+      label: "DeepSeek-Reasoner"
+      description: "推理模型（R1），会先思考再作答，适合复杂推理问题"
+  defaults:
+    temperature: 0.3
+    top_p: 0.8
+    max_tokens: 2048
+    history_rounds: 5
+
+# ---------------------------------------------------------------------------
+# RAG 检索参数
+# ---------------------------------------------------------------------------
+rag:
+  chunk:
+    size: 500                                # 默认切块大小（字符）
+    overlap: 50                              # 默认重叠大小（字符）
+  retrieval:
+    mode: "hybrid"                           # dense（稠密）| hybrid（稠密+稀疏混合）
+    top_k: 5                                 # 最终注入提示词的分块数量
+    candidate_multiplier: 4                  # 召回候选数 = top_k * 倍数
+    score_threshold: 0.2                     # 低于该分数的分块丢弃
+    hybrid_alpha: 0.7                        # 混合检索中稠密向量权重（1-alpha 为稀疏权重）
+  query_rewrite:
+    enabled: false                           # 开启后用大模型把用户问题改写为检索式
+  context:
+    max_chars: 6000                          # 注入提示词的上下文最大字符数
+
+# ---------------------------------------------------------------------------
+# 文档解析（图片 OCR 走 DashScope 多模态模型）
+# ---------------------------------------------------------------------------
+parser:
+  ocr:
+    provider: "dashscope"                    # dashscope（qwen-vl-ocr，云端）| pytesseract（本地，需安装 tesseract）
+    model: "qwen-vl-ocr-latest"
+    base_url: "https://dashscope.aliyuncs.com/api/v1"
+    api_key: "${DASHSCOPE_API_KEY:-sk-请替换为你的DashScope-API-Key}"
+    timeout: 60
+    language: "chi_sim+eng"                  # pytesseract 语言包
+  pdf:
+    max_pages: 300
+
+# ---------------------------------------------------------------------------
+# 图形验证码
+# ---------------------------------------------------------------------------
+captcha:
+  length: 4
+  width: 130
+  height: 44
+  expire_seconds: 300
+  # 是否在接口返回中附带答案（仅本地调试用，生产请保持 false）
+  debug_expose: false
